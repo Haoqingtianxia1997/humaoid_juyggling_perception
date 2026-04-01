@@ -1,0 +1,28 @@
+<mujoco>
+    <body name="tool_left" pos="0.28 0 -0.015" euler="3.1415926 0 -1.57079632679">
+        <geom class="visual" mesh="cup" />
+        <site name="left_cup" pos="0 0.14 0.006" size="0.01" rgba="0.5 0.5 0 1" group="3" />
+        <inertial mass="0.1" pos="-1.614e-7 0.07053 -5.0162e-3"
+            fullinertia="2.91421979e-04 7.17505061e-05 3.00838373e-04 3.23370120e-10 -1.18032357e-10 3.27600743e-05" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 0.31415927" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 0.62831853" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 0.9424778" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 1.25663706" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 1.57079633" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 1.88495559" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 2.19911486" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 2.51327412" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 2.82743339" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 3.14159265" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 3.45575192" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 3.76991118" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 4.08407045" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 4.39822972" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 4.71238898" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 5.02654825" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 5.34070751" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 5.65486678" />
+        <!-- <geom class="cup_collision" euler="3.1415926 0 5.96902604" /> -->
+        <geom class="cup_collision" euler="3.1415926 0 6.28318530" />
+    </body>
+</mujoco>

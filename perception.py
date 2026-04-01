@@ -4,6 +4,9 @@ import cv2
 from scipy.optimize import linear_sum_assignment
 
 
+IGNORE_BOTTOM_ROWS = 30 #110  # RGB图像底部不参与检测的像素行数
+
+
 class CameraIntrinsics:
     """相机内参"""
     
@@ -444,119 +447,6 @@ class KalmanFilter3D:
         self.initialized = False
         self.update_count = 0
 
-class DeterministicKF3D:
-    """
-    确定性3D运动预测器（零过程噪声、零观测噪声）
-
-    用途：系统噪声在线估计
-    工作原理：
-      1. 将每帧的位置观测视为 ground truth，直接设置当前状态。
-      2. 使用与 KalmanFilter3D 相同的物理模型（重力 + 空气阻力）做
-         一步确定性预测，结果存入 pending_prediction。
-      3. 下一帧有新观测时，计算残差 = 新观测 - pending_prediction[:3]。
-         该残差反映了物理模型的实际预测误差（即系统噪声量级）。
-
-    速度估计策略：
-      - 若调用方提供 obs_vel，则直接使用（推荐传入当前 KF 的速度估计）。
-      - 否则，用相邻两帧位置差分 (Δpos / dt) 近似估计速度。
-    """
-
-    def __init__(self, dt=0.002, g=9.8, drag_coefficient=0.0):
-        self.dt = dt
-        self.g = g
-        self.drag_coefficient = drag_coefficient
-
-        # 当前状态 [x, y, z, vx, vy, vz]
-        self.x = np.zeros(6)
-        self.initialized = False
-
-        # 上一帧观测位置（仅在 obs_vel=None 时用于速度差分估计）
-        self.prev_obs_pos = None
-
-        # 由当前帧状态预测得到的下一帧状态（供下帧计算残差）
-        self.pending_prediction = None
-
-        # 与 KalmanFilter3D 完全相同的运动模型
-        self.F = np.array([
-            [1, 0, 0, dt, 0, 0],
-            [0, 1, 0, 0, dt, 0],
-            [0, 0, 1, 0, 0, dt],
-            [0, 0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 0, 1]
-        ])
-        self.B = np.array([0, 0, -0.5 * g * dt ** 2, 0, 0, -g * dt])
-
-    def _physics_predict(self, state):
-        """从给定状态做一步无噪声的确定性物理预测"""
-        dt = self.dt
-        pos = state[:3]
-        vel = state[3:]
-
-        a_gravity = np.array([0.0, 0.0, -self.g], dtype=float)
-        speed = np.linalg.norm(vel)
-        if self.drag_coefficient > 0.0 and speed > 1e-12:
-            # 与 KalmanFilter3D 相同：a_drag = -k * ||v|| * v
-            a_drag = -self.drag_coefficient * speed * vel
-        else:
-            a_drag = np.zeros(3, dtype=float)
-
-        a_total = a_gravity + a_drag
-
-        x_pred = np.zeros(6, dtype=float)
-        x_pred[:3] = pos + vel * dt + 0.5 * a_total * dt ** 2
-        x_pred[3:] = vel + a_total * dt
-        return x_pred
-
-    def update_with_observation(self, obs_pos, obs_vel=None):
-        """
-        用当前帧观测设置状态（视为 ground truth），并预测下一帧。
-
-        Args:
-            obs_pos : 当前观测位置 [x, y, z]（世界坐标系）
-            obs_vel : 当前速度估计 [vx, vy, vz]（可选）。
-                      若为 None，则用位置差分估计；第一帧无法差分，速度取 0。
-
-        Returns:
-            residual : np.ndarray([dx, dy, dz]) 或 None
-                       若已有上一帧的 pending_prediction，返回
-                       obs_pos - pending_prediction[:3]（即模型预测误差）；
-                       第一次调用（尚无 pending_prediction）返回 None。
-        """
-        obs_pos = np.array(obs_pos, dtype=float)
-
-        # 计算与上帧预测的残差
-        residual = None
-        if self.initialized and self.pending_prediction is not None:
-            residual = obs_pos - self.pending_prediction[:3]
-
-        # 确定速度
-        if obs_vel is not None:
-            velocity = np.array(obs_vel, dtype=float)
-        elif self.initialized and self.prev_obs_pos is not None:
-            velocity = (obs_pos - self.prev_obs_pos) / self.dt
-        else:
-            velocity = np.zeros(3)
-
-        # 用观测直接设置状态（ground truth）
-        self.x[:3] = obs_pos
-        self.x[3:] = velocity
-
-        # 预测下一帧，存储以备下帧计算残差
-        self.pending_prediction = self._physics_predict(self.x)
-
-        self.prev_obs_pos = obs_pos.copy()
-        self.initialized = True
-
-        return residual
-
-    def reset(self):
-        """重置预测器状态"""
-        self.x = np.zeros(6)
-        self.initialized = False
-        self.prev_obs_pos = None
-        self.pending_prediction = None
-
 
 class MultiRedBallDetector:
     """多红色球体检测器 - 同时检测多个球（基于轮廓的方法）
@@ -573,11 +463,14 @@ class MultiRedBallDetector:
         self.close_kernel = np.ones((21, 21), np.uint8)
         
         # 球体形状约束
-        self.min_area = 1500  # 最小面积
+        self.min_area = 500  # 最小面积
         self.max_area = 9000  # 最大面积
         self.min_circularity = 0.5  # 最小圆形度（与zed_image_saver.py保持一致）
+
+        # 底部屏蔽区域（不做detect）
+        self.ignore_bottom_rows = IGNORE_BOTTOM_ROWS
     
-    def detect_all(self, image, camera_intrinsics=None):
+    def detect_all(self, image, camera_intrinsics=None, depth_image=None, center_method="min_depth"):
         """
         检测图像中的所有球体（使用轮廓检测）
         
@@ -587,6 +480,11 @@ class MultiRedBallDetector:
         Args:
             image: BGR图像（必须已经过深度mask处理，黑色区域为深度>阈值的区域）
             camera_intrinsics: CameraIntrinsics对象（可选，本检测器不使用）
+            depth_image: 深度图（可选，用于 center_method='min_depth'）
+            center_method: 中心点计算方式
+                - 'min_depth': 取轮廓内最小深度对应像素（推荐）
+                - 'nearest': 几何角平分线交点
+ 
             
         Returns:
             list of detections: 每个元素包含检测信息字典
@@ -597,6 +495,12 @@ class MultiRedBallDetector:
         # 二值化（检测非黑色区域）
         # 阈值设为1，将所有非完全黑色的像素识别为前景
         _, binary = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+
+        # 屏蔽图像最下面N行，不参与检测
+        if self.ignore_bottom_rows > 0:
+            h = binary.shape[0]
+            cut_y = max(h - self.ignore_bottom_rows, 0)
+            binary[cut_y:, :] = 0
         
         # 形态学操作，去除噪声
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, self.open_kernel)
@@ -645,49 +549,157 @@ class MultiRedBallDetector:
                 
                 hori_line = (leftmost, rightmost)
                 vert_line = (topmost, bottommost)
+
+                intersection = None
                 
                 # 计算角平分线交点（球心）
-                if camera_intrinsics is not None:
-                    # X方向角平分线
-                    left_x_norm = (leftmost[0] - camera_intrinsics.cx) / camera_intrinsics.fx
-                    right_x_norm = (rightmost[0] - camera_intrinsics.cx) / camera_intrinsics.fx
-                    
-                    ray_left = np.array([left_x_norm, 0, -1])
-                    ray_right = np.array([right_x_norm, 0, -1])
-                    ray_left = ray_left / np.linalg.norm(ray_left)
-                    ray_right = ray_right / np.linalg.norm(ray_right)
-                    
-                    bisector_xz = ray_left + ray_right
-                    bisector_xz = bisector_xz / np.linalg.norm(bisector_xz)
-                    
-                    t_x = -1.0 / bisector_xz[2]
-                    bisector_x_cam = t_x * bisector_xz[0]
-                    bisector_x_pixel = bisector_x_cam * camera_intrinsics.fx + camera_intrinsics.cx
-                    
-                    # Y方向角平分线
-                    top_y_norm = (topmost[1] - camera_intrinsics.cy) / camera_intrinsics.fy
-                    bottom_y_norm = (bottommost[1] - camera_intrinsics.cy) / camera_intrinsics.fy
-                    
-                    ray_top = np.array([0, top_y_norm, -1])
-                    ray_bottom = np.array([0, bottom_y_norm, -1])
-                    ray_top = ray_top / np.linalg.norm(ray_top)
-                    ray_bottom = ray_bottom / np.linalg.norm(ray_bottom)
-                    
-                    bisector_yz = ray_top + ray_bottom
-                    bisector_yz = bisector_yz / np.linalg.norm(bisector_yz)
-                    
-                    t_y = -1.0 / bisector_yz[2]
-                    bisector_y_cam = t_y * bisector_yz[1]
-                    bisector_y_pixel = bisector_y_cam * camera_intrinsics.fy + camera_intrinsics.cy
-                    
-                    intersection = (int(bisector_x_pixel), int(bisector_y_pixel))
-                    center = intersection
-                else:
-                    # 如果没有相机内参，回退到简单的中点计算
-                    x = int((leftmost[0] + rightmost[0]) / 2)
-                    y = int((topmost[1] + bottommost[1]) / 2)
-                    center = (x, y)
+                if center_method== "nearest":
+                    if camera_intrinsics is not None:
+                        # X方向角平分线
+                        left_x_norm = (leftmost[0] - camera_intrinsics.cx) / camera_intrinsics.fx
+                        right_x_norm = (rightmost[0] - camera_intrinsics.cx) / camera_intrinsics.fx
+                        
+                        ray_left = np.array([left_x_norm, 0, -1])
+                        ray_right = np.array([right_x_norm, 0, -1])
+                        ray_left = ray_left / np.linalg.norm(ray_left)
+                        ray_right = ray_right / np.linalg.norm(ray_right)
+                        
+                        bisector_xz = ray_left + ray_right
+                        bisector_xz = bisector_xz / np.linalg.norm(bisector_xz)
+                        
+                        t_x = -1.0 / bisector_xz[2]
+                        bisector_x_cam = t_x * bisector_xz[0]
+                        bisector_x_pixel = bisector_x_cam * camera_intrinsics.fx + camera_intrinsics.cx
+                        
+                        # Y方向角平分线
+                        top_y_norm = (topmost[1] - camera_intrinsics.cy) / camera_intrinsics.fy
+                        bottom_y_norm = (bottommost[1] - camera_intrinsics.cy) / camera_intrinsics.fy
+                        
+                        ray_top = np.array([0, top_y_norm, -1])
+                        ray_bottom = np.array([0, bottom_y_norm, -1])
+                        ray_top = ray_top / np.linalg.norm(ray_top)
+                        ray_bottom = ray_bottom / np.linalg.norm(ray_bottom)
+                        
+                        bisector_yz = ray_top + ray_bottom
+                        bisector_yz = bisector_yz / np.linalg.norm(bisector_yz)
+                        
+                        t_y = -1.0 / bisector_yz[2]
+                        bisector_y_cam = t_y * bisector_yz[1]
+                        bisector_y_pixel = bisector_y_cam * camera_intrinsics.fy + camera_intrinsics.cy
+                        
+                        intersection = (int(bisector_x_pixel), int(bisector_y_pixel))
+                        center = intersection
+                    else:
+                        # 如果没有相机内参，回退到简单的中点计算
+                        x = int((leftmost[0] + rightmost[0]) / 2)
+                        y = int((topmost[1] + bottommost[1]) / 2)
+                        center = (x, y)
+                        intersection = center
+                
+                elif center_method == "min_depth":
+                    center = None
+
+                    if depth_image is not None:
+                        mask = np.zeros(depth_image.shape[:2], dtype=np.uint8)
+                        cv2.drawContours(mask, [contour], -1, 255, thickness=-1)
+
+                        ys, xs = np.where(mask > 0)
+                        if xs.size > 0:
+                            depth_vals = depth_image[ys, xs]
+                            valid = np.isfinite(depth_vals) & (depth_vals > 0) & (depth_vals < 10.0)
+
+                            if np.any(valid):
+                                valid_depths = depth_vals[valid].astype(np.float32)
+                                valid_xs = xs[valid].astype(np.int32)
+                                valid_ys = ys[valid].astype(np.int32)
+
+                                # 1) 先做统计离群值过滤，抑制前景飞点（极小深度噪声）
+                                q1 = np.percentile(valid_depths, 25)
+                                q3 = np.percentile(valid_depths, 75)
+                                iqr = q3 - q1
+                                if iqr > 1e-6:
+                                    lower = q1 - 1.5 * iqr
+                                    upper = q3 + 1.5 * iqr
+                                    inlier = (valid_depths >= lower) & (valid_depths <= upper)
+                                else:
+                                    # 深度分布很窄时用MAD兜底
+                                    med = np.median(valid_depths)
+                                    mad = np.median(np.abs(valid_depths - med))
+                                    if mad > 1e-6:
+                                        lower = med - 3.5 * mad
+                                        upper = med + 3.5 * mad
+                                        inlier = (valid_depths >= lower) & (valid_depths <= upper)
+                                    else:
+                                        inlier = np.ones_like(valid_depths, dtype=bool)
+
+                                inlier_depths = valid_depths[inlier]
+                                inlier_xs = valid_xs[inlier]
+                                inlier_ys = valid_ys[inlier]
+
+                                if inlier_depths.size > 0:
+                                    # 2) 在浅层点里找“连通且成片”的最近区域，而不是单个最小值
+                                    shallow_thr = np.percentile(inlier_depths, 20)
+                                    shallow_sel = inlier_depths <= shallow_thr
+
+                                    if np.any(shallow_sel):
+                                        shallow_mask = np.zeros(mask.shape, dtype=np.uint8)
+                                        shallow_mask[inlier_ys[shallow_sel], inlier_xs[shallow_sel]] = 255
+
+                                        # 去掉孤立噪点，保留真实球面浅层区域
+                                        kernel = np.ones((3, 3), np.uint8)
+                                        shallow_mask = cv2.morphologyEx(shallow_mask, cv2.MORPH_OPEN, kernel)
+
+                                        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(shallow_mask, connectivity=8)
+
+                                        # 选择面积最大的浅层连通区域（跳过背景label=0）
+                                        best_label = -1
+                                        best_area = 0
+                                        for label in range(1, num_labels):
+                                            area_label = stats[label, cv2.CC_STAT_AREA]
+                                            if area_label > best_area:
+                                                best_area = area_label
+                                                best_label = label
+
+                                        if best_label > 0:
+                                            ys_comp, xs_comp = np.where(labels == best_label)
+                                            if xs_comp.size > 0:
+                                                comp_depths = depth_image[ys_comp, xs_comp]
+                                                comp_valid = np.isfinite(comp_depths) & (comp_depths > 0) & (comp_depths < 10.0)
+                                                if np.any(comp_valid):
+                                                    comp_depths_valid = comp_depths[comp_valid]
+                                                    comp_xs_valid = xs_comp[comp_valid]
+                                                    comp_ys_valid = ys_comp[comp_valid]
+                                                    min_idx = int(np.argmin(comp_depths_valid))
+                                                    center = (int(comp_xs_valid[min_idx]), int(comp_ys_valid[min_idx]))
+
+                                    # 连通浅层区域不可用时，回退到inlier中的最浅点
+                                    if center is None:
+                                        min_idx = int(np.argmin(inlier_depths))
+                                        center = (int(inlier_xs[min_idx]), int(inlier_ys[min_idx]))
+
+                    # 深度不可用时回退到质心
+                    if center is None:
+                        M = cv2.moments(contour)
+                        if M["m00"] != 0:
+                            cx = int(M["m10"] / M["m00"])
+                            cy = int(M["m01"] / M["m00"])
+                            center = (cx, cy)
+                        else:
+                            center = tuple(map(int, cv2.boundingRect(contour)[:2]))
+
                     intersection = center
+                else:
+                    # 未知模式回退到质心
+                    M = cv2.moments(contour)
+                    if M["m00"] != 0:
+                        cx = int(M["m10"] / M["m00"])
+                        cy = int(M["m01"] / M["m00"])
+                        center = (cx, cy)
+                    else:
+                        center = tuple(map(int, cv2.boundingRect(contour)[:2]))
+                    intersection = center
+      
+                
                 
                 # 计算综合评分（用于兼容性）
                 score = circularity
@@ -1318,7 +1330,8 @@ class BallTracker:
         return np.mean(valid_depths)
     
     def detect_and_localize_balls(self, rgb_image, depth_image, 
-                                camera_intrinsics, camera_pos, camera_rot):
+                                camera_intrinsics, camera_pos, camera_rot,
+                                center_method="min_depth", ball_radius=0.0375):
         """检测并重建所有球的3D位置
 
         Args:
@@ -1332,13 +1345,17 @@ class BallTracker:
             list of (ball_position_world, detection_info, ray_info)
         """
         # 检测所有球
-        detections = self.detector.detect_all(rgb_image, camera_intrinsics)
+        detections = self.detector.detect_all(
+            rgb_image,
+            camera_intrinsics,
+            depth_image=depth_image,
+            center_method=center_method
+        )
 
         if not detections:
             return []
 
         results = []
-        ball_radius = 0.0375  # 米
 
         for det in detections:
             center = det['center']
@@ -1354,10 +1371,16 @@ class BallTracker:
                 continue
             
             # 球半径补偿
-            ray_direction = camera_intrinsics.pixel_to_camera_ray(x, y)
-            actual_ray_length = abs(depth_surface / ray_direction[2]) + ball_radius
-            point_cam = actual_ray_length * ray_direction 
-            
+            if center_method == "nearest":
+                ray_direction = camera_intrinsics.pixel_to_camera_ray(x, y)
+                actual_ray_length = abs(depth_surface / ray_direction[2]) + ball_radius
+                point_cam = actual_ray_length * ray_direction 
+            elif center_method == "min_depth":
+                depth_surface += ball_radius
+                point_cam = depth_surface * camera_intrinsics.pixel_to_camera_ray(x, y)
+                ray_direction = point_cam / np.linalg.norm(point_cam)
+                actual_ray_length = np.linalg.norm(point_cam)
+         
             # 转换到世界坐标系
             point_world = camera_pos + camera_rot @ point_cam
             
@@ -1388,7 +1411,10 @@ class BallTracker:
         max_velocity_uncertainty,
         test_mode_enabled=False,
         upgrade_counter=None,
-        max_upgrades_after_valid=10
+        max_upgrades_after_valid=10,
+        center_method="min_depth",
+        ball_radius=0.0375
+        
     ):
         """
         处理球检测、追踪更新和状态维护的完整流程
@@ -1412,15 +1438,16 @@ class BallTracker:
             has_detection: dict，记录每个追踪器是否有检测
             detection_results: 检测结果列表 [(pos_world, det_info, ray_info), ...]
             actually_updated: dict，记录每个追踪器是否真正执行了update操作
-            detected_pos_per_tracker: dict {tracker_id: raw_obs_pos_world}，供外部噪声估计使用
-            matched_det_idx_per_tracker: dict {tracker_id: det_idx}，tracker 与 detection_results 的匹配索引
+            assignments: dict，Tracker与检测索引的匹配关系 {tracker_id: det_idx}
         """
         import numpy as np
         
         # 检测并定位所有球
         detection_results = self.detect_and_localize_balls(
             rgb_bgr, depth_array,
-            camera_intrinsics, cam_pos, cam_mat
+            camera_intrinsics, cam_pos, cam_mat,
+            center_method=center_method,
+            ball_radius=ball_radius
         )
         
         # 提取3D位置
@@ -1429,8 +1456,7 @@ class BallTracker:
         # 初始化检测标记和实际更新标记
         has_detection = {}
         actually_updated = {}
-        detected_pos_per_tracker = {}  # {tracker_id: raw_obs_pos_world}，供噪声估计使用
-        matched_det_idx_per_tracker = {}  # {tracker_id: det_idx}，供外部复用匹配索引
+        assignments = {}
         for tracker_id in range(self.num_balls):
             has_detection[tracker_id] = False
             actually_updated[tracker_id] = False
@@ -1446,9 +1472,6 @@ class BallTracker:
             # 步骤2: 根据test_mode决定是否真正执行update
             for tracker_id, det_idx in assignments.items():
                 has_detection[tracker_id] = True
-                # 记录原始观测位置（世界坐标系），供外部确定性KF使用
-                detected_pos_per_tracker[tracker_id] = detected_positions[det_idx].copy()
-                matched_det_idx_per_tracker[tracker_id] = det_idx
                 
                 # 判断是否应该执行update
                 should_update = True
@@ -1526,7 +1549,7 @@ class BallTracker:
                         self.consecutive_detections[tracker_id] = 0
                         self.kf_filters[tracker_id].reset()
         
-        return has_detection, detection_results, actually_updated, detected_pos_per_tracker, matched_det_idx_per_tracker
+        return has_detection, detection_results, actually_updated, assignments
     
     @staticmethod
     def catch_info_from_kf_obs_body(kf_obs_body):

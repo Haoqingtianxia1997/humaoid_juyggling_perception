@@ -1,6 +1,59 @@
-# ZED Ball Tracking System
+# ZED Subscriber（已按当前代码更新）
 
-基于ZED相机的球体追踪系统，使用卡尔曼滤波进行3D轨迹预测。
+基于当前仓库代码（2026-04-01）整理的使用说明。
+
+## 快速导航（以此为准）
+
+### 核心脚本
+
+- `zed_tracker_deploy.py`：在线 ROS2 追踪主节点（发布 `catch_info` / `/ball_markers`）
+- `perception.py`：检测 + 多目标关联 + 3D 卡尔曼滤波核心
+- `Tracker_config.yaml`：相机内外参与追踪参数
+- `visualize_Tracker_3d.py`：Open3D 交互式 3D 可视化（支持 `--add-gt-pos` 回写）
+- `offline_kf_from_trajectory.py`：离线 KF 重放与对比图导出
+- `cacu_noise.py`：拟合与误差统计（`ols/ransac/huber`）
+- `zed_image_saver.py`：RGB/Depth 同步采集调试工具（`--save` 开启保存）
+
+### 已确认的轨迹目录与字段
+
+- 在线追踪保存目录：`trajectory_data/`
+- 每条轨迹：`trajectory_tracker{ID}_{time}_{counter}.json` + 同名图像子目录
+- 帧字段包含：
+  - `detection_pos`
+  - `kf_pos`
+  - `kf_vel`
+  - `kf_state`（`upgrade`/`predict`）
+  - `rgb_file`
+  - `rgb_overlay_file`
+  - `depth_file`
+- 轨迹顶层包含：`coord_frame`（`body`/`world`）
+
+### 关键变化（相对旧文档）
+
+- 当前 3D 可视化脚本名是：`visualize_Tracker_3d.py`（不是 `visualize_trajectory_3d.py`）
+- 当前目录不存在：`visualize_trajectory.py`、`detection_process.py`
+- `zed_tracker_deploy.py` 启动时会清空 `trajectory_data/`
+
+### 常用命令
+
+```bash
+# 在线追踪
+python3 zed_tracker_deploy.py
+
+# 3D 可视化（自动扫描 trajectory_data）
+python3 visualize_Tracker_3d.py
+
+# 离线 KF 重放
+python3 offline_kf_from_trajectory.py --trajectory-dir trajectory_data
+
+# 误差统计
+python3 cacu_noise.py --trajectory-dir trajectory_data --no-show
+
+# 图像采集（启动即保存）
+python3 zed_image_saver.py --save
+```
+
+<!--
 
 ## 系统概述
 
@@ -182,8 +235,7 @@ data/
   processed_rgb/    # 标注后的RGB图像 (PNG)
 ```
 
----
-
+<!--
 #### `detection_process.py` - 离线批量检测
 对已保存的图像数据进行批量球体检测和标注
 
@@ -466,3 +518,5 @@ zed_subscriber/
 ## 联系与贡献
 
 如有问题或建议，请联系项目维护者。
+
+-->

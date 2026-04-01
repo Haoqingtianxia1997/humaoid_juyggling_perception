@@ -138,14 +138,14 @@ class ZedImageSaver(Node):
         # 调整图像大小到 640x360
         cv_image = cv2.resize(cv_image, (640, 360))
         # 顺时针旋转90度
-        cv_image = cv2.rotate(cv_image, cv2.ROTATE_90_CLOCKWISE)
+        # cv_image = cv2.rotate(cv_image, cv2.ROTATE_90_CLOCKWISE)
         
         # 处理深度图像
         cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         # 调整深度图大小到 640x360
         cv_depth = cv2.resize(cv_depth, (640, 360), interpolation=cv2.INTER_NEAREST)
         # 顺时针旋转90度
-        cv_depth = cv2.rotate(cv_depth, cv2.ROTATE_90_CLOCKWISE)
+        # cv_depth = cv2.rotate(cv_depth, cv2.ROTATE_90_CLOCKWISE)
         
         # 生成可视化深度图
         valid_mask = np.isfinite(cv_depth) & (cv_depth > 0)
