@@ -4,9 +4,6 @@ import cv2
 from scipy.optimize import linear_sum_assignment
 
 
-IGNORE_BOTTOM_ROWS = 30 #110  # RGB图像底部不参与检测的像素行数
-
-
 class CameraIntrinsics:
     """相机内参"""
     
@@ -120,38 +117,1024 @@ class CameraIntrinsics:
         
         return np.array([x, y, z])
 
+# #原始版本
+# class KalmanFilter3D:
+#     """
+#     简化版3D卡尔曼滤波器（纯观测驱动，无速度估计）
+#     状态向量: [x, y, z, vx, vy, vz]
+#     """
+    
+#     def __init__(self, dt=0.002, g=9.8, process_noise=0.1, measurement_noise=0.05, drag_coefficient=0.0, verbose=False):
+#         """
+#         初始化卡尔曼滤波器
+        
+#         Args:
+#             dt: 时间步长（秒）
+#             g: 重力加速度（m/s²）
+#             process_noise: 过程噪声标准差（加速度噪声标准差，单位 m/s²）
+#             measurement_noise: 测量噪声标准差（位置测量标准差，单位 m）
+#             drag_coefficient: 空气阻力系数（二次阻力模型中的 k，单位 1/m）
+#                              满足 a_drag = -k * ||v|| * v
+#             verbose: 是否打印详细日志
+#         """
+#         self.dt = dt
+#         self.g = g
+#         self.drag_coefficient = drag_coefficient
+#         self.verbose = verbose
+        
+#         # 状态向量 [x, y, z, vx, vy, vz]
+#         self.x = np.zeros(6, dtype=float)
+        
+#         # 状态协方差矩阵
+#         self.P = np.eye(6, dtype=float) * 10.0
+#         self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
+        
+#         # 基础状态转移矩阵（保留变量名；实际 predict 时会构造线性化后的 self.F）
+#         self.F = np.array([
+#             [1, 0, 0, dt, 0, 0],
+#             [0, 1, 0, 0, dt, 0],
+#             [0, 0, 1, 0, 0, dt],
+#             [0, 0, 0, 1, 0, 0],
+#             [0, 0, 0, 0, 1, 0],
+#             [0, 0, 0, 0, 0, 1]
+#         ], dtype=float)
+        
+#         # 控制输入矩阵（保留变量名；predict 里仍会更新使用）
+#         self.B = np.array([0, 0, -0.5 * g * dt**2, 0, 0, -g * dt], dtype=float)
+        
+#         # 观测矩阵（只观测位置）
+#         self.H = np.array([
+#             [1, 0, 0, 0, 0, 0],
+#             [0, 1, 0, 0, 0, 0],
+#             [0, 0, 1, 0, 0, 0]
+#         ], dtype=float)
+        
+#         # 过程噪声协方差 Q（6×6，基于加速度扰动模型）
+#         if isinstance(process_noise, (list, np.ndarray)):
+#             sigma_a = np.array(process_noise, dtype=float).reshape(3)  # [ax, ay, az]
+#         else:
+#             sigma_a = np.full(3, process_noise, dtype=float)
+        
+#         Da = np.diag(sigma_a ** 2)   # 3×3 加速度扰动协方差
+#         Q_pp = (dt**4 / 4.0) * Da    # 位置-位置块
+#         Q_pv = (dt**3 / 2.0) * Da    # 位置-速度块
+#         Q_vv = (dt**2) * Da          # 速度-速度块
+#         self.Q = np.block([
+#             [Q_pp, Q_pv],
+#             [Q_pv, Q_vv]
+#         ]).astype(float)
+        
+#         # 测量噪声协方差 R（3×3，各向异性）
+#         if isinstance(measurement_noise, (list, np.ndarray)):
+#             sigma_m = np.array(measurement_noise, dtype=float).reshape(3)  # [mx, my, mz]
+#         else:
+#             sigma_m = np.full(3, measurement_noise, dtype=float)
+        
+#         self.R = np.diag(sigma_m ** 2).astype(float)
+        
+#         self.initialized = False
+#         self.update_count = 0  # 记录更新次数，用于判断速度估计是否可靠
+
+#         # 最近一次更新的创新统计（用于不确定性归一化诊断）
+#         # r = z - Hx_prior, S = HPH^T + R, nu_i = |r_i| / sqrt(S_ii)
+#         self.last_innovation = None
+#         self.last_innovation_S_diag = None
+#         self.last_normalized_innovation = None
+#         self.last_innovation_mahalanobis2 = None
+        
+        
+#     def initialize(self, position, velocity=None):
+#         """
+#         初始化滤波器状态
+        
+#         Args:
+#             position: 初始位置 [x, y, z]
+#             velocity: 初始速度 [vx, vy, vz]，默认为0
+#         """
+#         if velocity is None:
+#             velocity = np.zeros(3, dtype=float)
+        
+#         self.x[:3] = np.asarray(position, dtype=float)
+#         self.x[3:] = np.asarray(velocity, dtype=float)
+        
+#         # 初始协方差：位置较确定，速度不确定
+#         self.P = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]).astype(float)
+#         self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
+        
+#         self.initialized = True
+    
+#     def _compute_drag_acceleration_and_jacobian(self, velocity):
+#         """
+#         计算二次阻力加速度及其对速度的雅可比
+        
+#         a_drag = -k * ||v|| * v
+        
+#         Returns:
+#             a_drag: shape (3,)
+#             J_drag: da_drag / dv, shape (3,3)
+#         """
+#         v = np.asarray(velocity, dtype=float)
+#         speed = np.linalg.norm(v)
+#         k = self.drag_coefficient
+        
+#         if k <= 0.0 or speed < 1e-12:
+#             a_drag = np.zeros(3, dtype=float)
+#             J_drag = np.zeros((3, 3), dtype=float)
+#             return a_drag, J_drag
+        
+#         # 二次阻力加速度
+#         a_drag = -k * speed * v
+        
+#         # 雅可比：
+#         # d/dv ( ||v|| v ) = ||v|| I + (v v^T)/||v||
+#         I3 = np.eye(3, dtype=float)
+#         outer_v = np.outer(v, v)
+#         J_drag = -k * (speed * I3 + outer_v / speed)
+        
+#         return a_drag, J_drag
+        
+#     def predict(self):
+#         """预测步骤（考虑重力和二次空气阻力）"""
+#         if not self.initialized:
+#             return
+        
+#         start_time = time.perf_counter() if self.verbose else None
+        
+#         dt = self.dt
+#         pos = self.x[:3].copy()
+#         vel = self.x[3:].copy()
+        
+#         # 重力加速度
+#         a_gravity = np.array([0.0, 0.0, -self.g], dtype=float)
+        
+#         # 二次阻力加速度及其雅可比
+#         a_drag, J_drag = self._compute_drag_acceleration_and_jacobian(vel)
+        
+#         # 总加速度
+#         a_total = a_gravity + a_drag
+        
+#         # 状态预测（非线性）
+#         pos_new = pos + vel * dt + 0.5 * a_total * dt**2
+#         vel_new = vel + a_total * dt
+        
+#         self.x[:3] = pos_new
+#         self.x[3:] = vel_new
+        
+#         # 用当前位置线性化后的雅可比传播协方差
+#         # p_{k+1} = p_k + v_k dt + 0.5 a(v_k) dt^2
+#         # v_{k+1} = v_k + a(v_k) dt
+#         #
+#         # 因此：
+#         # d p_{k+1}/d v_k = dt I + 0.5 dt^2 J_drag
+#         # d v_{k+1}/d v_k = I + dt J_drag
+#         I3 = np.eye(3, dtype=float)
+#         self.F = np.block([
+#             [I3, dt * I3 + 0.5 * dt**2 * J_drag],
+#             [np.zeros((3, 3), dtype=float), I3 + dt * J_drag]
+#         ])
+        
+#         # 保留变量名 B，但此时重力和阻力已经直接进了非线性状态更新
+#         self.B = np.array([0.0, 0.0, -0.5 * self.g * dt**2, 0.0, 0.0, -self.g * dt], dtype=float)
+        
+#         # 协方差预测
+#         self.P = self.F @ self.P @ self.F.T + self.Q
+        
+#         # 数值对称化，避免浮点误差把协方差搞歪
+#         self.P = 0.5 * (self.P + self.P.T)
+#         self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
+        
+#         if self.verbose:
+#             elapsed_time = (time.perf_counter() - start_time) * 1000.0
+#             print(f"[KF Predict] 耗时: {elapsed_time:.4f}ms")
+        
+#     def update(self, measurement, current_time=None):
+#         """
+#         更新步骤（简化版：纯卡尔曼更新，无额外速度估计）
+        
+#         Args:
+#             measurement: 观测值 [x, y, z]
+#             current_time: 当前时间（未使用，保留接口兼容性）
+#         """
+#         start_time = time.perf_counter() if self.verbose else None
+        
+#         measurement = np.asarray(measurement, dtype=float)
+        
+#         if not self.initialized:
+#             # 第一次观测：初始化，速度设为0
+#             self.initialize(measurement, velocity=np.zeros(3, dtype=float))
+#             self.last_innovation = None
+#             self.last_innovation_S_diag = None
+#             self.last_normalized_innovation = None
+#             self.last_innovation_mahalanobis2 = None
+#             if self.verbose:
+#                 elapsed_time = (time.perf_counter() - start_time) * 1000.0
+#                 print(f"[KF Update-Init] 耗时: {elapsed_time:.4f}ms")
+#             return
+        
+#         # 标准卡尔曼更新
+#         y = measurement - self.H @ self.x
+#         S = self.H @ self.P @ self.H.T + self.R
+
+#         # 保存本次更新前的创新及其归一化结果（逐轴）
+#         S_diag = np.diag(S).astype(float)
+#         S_diag_safe = np.maximum(S_diag, 1e-12)
+#         nu = np.abs(y) / np.sqrt(S_diag_safe)
+#         try:
+#             Sinv_y = np.linalg.solve(S, y)
+#             d2 = float(y.T @ Sinv_y)
+#         except np.linalg.LinAlgError:
+#             d2 = float(y.T @ np.linalg.pinv(S) @ y)
+#         self.last_innovation = y.copy()
+#         self.last_innovation_S_diag = S_diag.copy()
+#         self.last_normalized_innovation = nu.copy()
+#         self.last_innovation_mahalanobis2 = d2
+        
+#         # 卡尔曼增益（避免显式求逆）
+#         PHt = self.P @ self.H.T
+#         K = np.linalg.solve(S.T, PHt.T).T
+        
+#         # 状态更新
+#         self.x = self.x + K @ y
+        
+#         # Joseph form 协方差更新
+#         I = np.eye(6, dtype=float)
+#         KH = K @ self.H
+#         self.P = (I - KH) @ self.P @ (I - KH).T + K @ self.R @ K.T
+        
+#         # 数值对称化
+#         self.P = 0.5 * (self.P + self.P.T)
+#         self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
+
+#         # 增加更新计数
+#         self.update_count += 1
+        
+#         if self.verbose:
+#             elapsed_time = (time.perf_counter() - start_time) * 1000.0
+#             print(f"[KF Update] 耗时: {elapsed_time:.4f}ms")
+        
+#     def get_state(self):
+#         """获取当前状态"""
+#         if not self.initialized:
+#             return None  # 未初始化时返回None,而不是全0状态
+#         p_diag = np.diag(self.P).astype(float)
+#         return {
+#             'position': self.x[:3].copy(),
+#             'velocity': self.x[3:].copy(),
+#             'full_state': self.x.copy(),
+#             'position_uncertainty': p_diag[:3].copy(),
+#             'velocity_uncertainty': self.velocity_uncertainty.copy(),
+#             'innovation_r': None if self.last_innovation is None else self.last_innovation.copy(),
+#             'innovation_S_diag': None if self.last_innovation_S_diag is None else self.last_innovation_S_diag.copy(),
+#             'normalized_innovation': None if self.last_normalized_innovation is None else self.last_normalized_innovation.copy(),
+#             'innovation_mahalanobis2': self.last_innovation_mahalanobis2,
+#         }
+    
+#     def predict_landing_position(self, z_threshold=0.15, min_updates=5, max_velocity_uncertainty=100.0):
+#         """
+#         预测小球落地时的位置
+        
+#         Args:
+#             z_threshold: 地面高度阈值（米）
+#             min_updates: 最小更新次数（用于判断速度估计是否可靠）
+#             max_velocity_uncertainty: 最大速度不确定性（协方差对角元素的阈值）
+        
+#         Returns:
+#             landing_pos: 落地位置 [x, y, z] 或 None（如果无法预测）
+#             landing_time: 落地时间（秒）或 None
+#         """
+#         if not self.initialized:
+#             return None, None
+        
+#         if self.update_count < min_updates:
+#             return None, None
+        
+#         velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
+#         if np.any(velocity_uncertainty > max_velocity_uncertainty):
+#             return None, None
+        
+#         pos = self.x[:3].copy()
+#         vel = self.x[3:].copy()
+        
+#         if pos[2] <= z_threshold or np.linalg.norm(vel) < 1e-6:
+#             return None, None
+        
+#         # 为了不改变你的对外接口，这里返回格式保持不变
+#         # 但因为现在模型已是二次阻力，解析抛体公式就不再严格成立
+#         # 所以这里改成数值积分预测落地
+#         dt_sim = min(self.dt, 0.002)
+#         max_steps = 20000
+        
+#         sim_pos = pos.copy()
+#         sim_vel = vel.copy()
+#         sim_time = 0.0
+        
+#         prev_pos = sim_pos.copy()
+#         prev_time = sim_time
+        
+#         for _ in range(max_steps):
+#             if sim_pos[2] <= z_threshold:
+#                 break
+            
+#             prev_pos = sim_pos.copy()
+#             prev_time = sim_time
+            
+#             speed = np.linalg.norm(sim_vel)
+#             if self.drag_coefficient > 0.0 and speed > 1e-12:
+#                 a_drag = -self.drag_coefficient * speed * sim_vel
+#             else:
+#                 a_drag = np.zeros(3, dtype=float)
+            
+#             a_total = np.array([0.0, 0.0, -self.g], dtype=float) + a_drag
+            
+#             sim_pos = sim_pos + sim_vel * dt_sim + 0.5 * a_total * dt_sim**2
+#             sim_vel = sim_vel + a_total * dt_sim
+#             sim_time += dt_sim
+        
+#         if sim_pos[2] > z_threshold:
+#             return None, None
+        
+#         # 线性插值过地面时刻
+#         z1 = prev_pos[2]
+#         z2 = sim_pos[2]
+        
+#         if abs(z2 - z1) < 1e-12:
+#             alpha = 1.0
+#         else:
+#             alpha = (z_threshold - z1) / (z2 - z1)
+#             alpha = np.clip(alpha, 0.0, 1.0)
+        
+#         landing_time = prev_time + alpha * (sim_time - prev_time)
+#         landing_pos = prev_pos + alpha * (sim_pos - prev_pos)
+#         landing_pos[2] = z_threshold
+        
+#         return landing_pos, landing_time
+    
+#     def reset(self):
+#         """重置滤波器"""
+#         self.x = np.zeros(6, dtype=float)
+#         self.P = np.eye(6, dtype=float) * 10.0
+#         self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
+#         self.initialized = False
+#         self.update_count = 0
+#         self.last_innovation = None
+#         self.last_innovation_S_diag = None
+#         self.last_normalized_innovation = None
+#         self.last_innovation_mahalanobis2 = None
+
+# # hard gating 版本
+# class KalmanFilter3D:
+#     """
+#     3D 卡尔曼滤波器（位置观测 + 速度状态，支持重力与二次空气阻力）
+#     状态向量: [x, y, z, vx, vy, vz]
+
+#     新增特性：
+#     1. x/y/z 三个方向分开做离群值判断
+#     2. 某一轴离群时，只忽略该轴；其他通过 gate 的轴仍参与更新
+#     3. 若三轴都离群，则整次更新拒绝
+#     """
+
+#     def __init__(
+#         self,
+#         dt=0.002,
+#         g=9.8,
+#         process_noise=0.1,
+#         measurement_noise=0.05,
+#         drag_coefficient=0.0,
+#         verbose=False,
+#         enable_axiswise_outlier_rejection=True,
+#         axis_gate_threshold=(3.0, 3.0, 3.0),
+#         axis_abs_residual_threshold=None,
+#     ):
+#         """
+#         初始化滤波器
+
+#         Args:
+#             dt: 时间步长（秒）
+#             g: 重力加速度（m/s²）
+#             process_noise: 过程噪声标准差（加速度噪声标准差，单位 m/s²）
+#                            可以是标量，也可以是长度为 3 的 [ax, ay, az]
+#             measurement_noise: 测量噪声标准差（位置测量标准差，单位 m）
+#                                可以是标量，也可以是长度为 3 的 [mx, my, mz]
+#             drag_coefficient: 空气阻力系数（二次阻力模型中的 k，单位 1/m）
+#                               满足 a_drag = -k * ||v|| * v
+#             verbose: 是否打印详细日志
+#             enable_axiswise_outlier_rejection: 是否开启逐轴离群值拒绝
+#             axis_gate_threshold: 逐轴 normalized innovation 的门限（单位：sigma）
+#                                  例如 (3.0, 3.0, 4.0)
+#             axis_abs_residual_threshold: 逐轴绝对残差门限（单位：m）
+#                                          例如 (0.10, 0.10, 0.25)
+#                                          若为 None，则不使用绝对残差门限
+#         """
+#         self.dt = dt
+#         self.g = g
+#         self.drag_coefficient = drag_coefficient
+#         self.verbose = verbose
+
+#         self.enable_axiswise_outlier_rejection = enable_axiswise_outlier_rejection
+#         self.axis_gate_threshold = np.asarray(axis_gate_threshold, dtype=float).reshape(3)
+
+#         if axis_abs_residual_threshold is None:
+#             self.axis_abs_residual_threshold = None
+#         else:
+#             self.axis_abs_residual_threshold = np.asarray(
+#                 axis_abs_residual_threshold, dtype=float
+#             ).reshape(3)
+
+#         # 状态向量 [x, y, z, vx, vy, vz]
+#         self.x = np.zeros(6, dtype=float)
+
+#         # 状态协方差矩阵
+#         self.P = np.eye(6, dtype=float) * 10.0
+#         self.velocity_uncertainty = np.diag(self.P)[3:]  # 速度分量方差
+
+#         # 基础状态转移矩阵（predict 时会按当前速度线性化更新）
+#         self.F = np.array([
+#             [1, 0, 0, dt, 0, 0],
+#             [0, 1, 0, 0, dt, 0],
+#             [0, 0, 1, 0, 0, dt],
+#             [0, 0, 0, 1, 0, 0],
+#             [0, 0, 0, 0, 1, 0],
+#             [0, 0, 0, 0, 0, 1]
+#         ], dtype=float)
+
+#         # 控制输入项（保留变量名；predict 里仍会更新）
+#         self.B = np.array([0, 0, -0.5 * g * dt**2, 0, 0, -g * dt], dtype=float)
+
+#         # 观测矩阵（只观测位置）
+#         self.H = np.array([
+#             [1, 0, 0, 0, 0, 0],  # x
+#             [0, 1, 0, 0, 0, 0],  # y
+#             [0, 0, 1, 0, 0, 0],  # z
+#         ], dtype=float)
+
+#         # 过程噪声协方差 Q（基于加速度白噪声模型）
+#         if isinstance(process_noise, (list, tuple, np.ndarray)):
+#             sigma_a = np.array(process_noise, dtype=float).reshape(3)
+#         else:
+#             sigma_a = np.full(3, process_noise, dtype=float)
+
+#         Da = np.diag(sigma_a ** 2)
+#         Q_pp = (dt**4 / 4.0) * Da
+#         Q_pv = (dt**3 / 2.0) * Da
+#         Q_vv = (dt**2) * Da
+#         self.Q = np.block([
+#             [Q_pp, Q_pv],
+#             [Q_pv, Q_vv]
+#         ]).astype(float)
+
+#         # 测量噪声协方差 R
+#         if isinstance(measurement_noise, (list, tuple, np.ndarray)):
+#             sigma_m = np.array(measurement_noise, dtype=float).reshape(3)
+#         else:
+#             sigma_m = np.full(3, measurement_noise, dtype=float)
+
+#         self.R = np.diag(sigma_m ** 2).astype(float)
+
+#         self.initialized = False
+#         self.update_count = 0  # 有效更新次数（至少有一个轴被采纳）
+
+#         # 统计信息
+#         self.rejected_updates = 0
+#         self.accepted_updates = 0
+#         self.partial_updates = 0
+#         self.consecutive_rejections = 0
+
+#         # 最近一次创新统计
+#         # r = z - Hx_prior
+#         # S = HPH^T + R
+#         # nu_i = |r_i| / sqrt(S_ii)
+#         self.last_innovation = None
+#         self.last_innovation_S_diag = None
+#         self.last_normalized_innovation = None
+#         self.last_innovation_mahalanobis2 = None
+
+#         # 最近一次逐轴 gate 结果
+#         self.last_axis_accepted_mask = None   # shape (3,), bool
+#         self.last_update_accepted = None      # bool，是否至少有一个轴被采纳
+
+#     def initialize(self, position, velocity=None):
+#         """
+#         初始化滤波器状态
+
+#         Args:
+#             position: 初始位置 [x, y, z]
+#             velocity: 初始速度 [vx, vy, vz]，默认为 0
+#         """
+#         if velocity is None:
+#             velocity = np.zeros(3, dtype=float)
+
+#         self.x[:3] = np.asarray(position, dtype=float)
+#         self.x[3:] = np.asarray(velocity, dtype=float)
+
+#         # 初始协方差：位置较确定，速度稍不确定
+#         self.P = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]).astype(float)
+#         self.velocity_uncertainty = np.diag(self.P)[3:]
+
+#         self.initialized = True
+
+#     def _compute_drag_acceleration_and_jacobian(self, velocity):
+#         """
+#         计算二次阻力加速度及其对速度的雅可比
+
+#         a_drag = -k * ||v|| * v
+
+#         Returns:
+#             a_drag: shape (3,)
+#             J_drag: shape (3, 3)
+#         """
+#         v = np.asarray(velocity, dtype=float)
+#         speed = np.linalg.norm(v)
+#         k = self.drag_coefficient
+
+#         if k <= 0.0 or speed < 1e-12:
+#             a_drag = np.zeros(3, dtype=float)
+#             J_drag = np.zeros((3, 3), dtype=float)
+#             return a_drag, J_drag
+
+#         a_drag = -k * speed * v
+
+#         I3 = np.eye(3, dtype=float)
+#         outer_v = np.outer(v, v)
+#         J_drag = -k * (speed * I3 + outer_v / speed)
+
+#         return a_drag, J_drag
+
+#     def _compute_innovation_statistics(self, measurement):
+#         """
+#         计算完整 3 维观测的创新统计量（基于 update 前先验状态）
+
+#         Returns:
+#             y: innovation, shape (3,)
+#             S: innovation covariance, shape (3,3)
+#             S_diag: diag(S), shape (3,)
+#             nu: normalized innovation, shape (3,)
+#             d2: full 3D squared Mahalanobis distance
+#         """
+#         measurement = np.asarray(measurement, dtype=float)
+
+#         y = measurement - self.H @ self.x
+#         S = self.H @ self.P @ self.H.T + self.R
+
+#         S_diag = np.diag(S).astype(float)
+#         S_diag_safe = np.maximum(S_diag, 1e-12)
+#         nu = np.abs(y) / np.sqrt(S_diag_safe)
+
+#         try:
+#             Sinv_y = np.linalg.solve(S, y)
+#             d2 = float(y.T @ Sinv_y)
+#         except np.linalg.LinAlgError:
+#             d2 = float(y.T @ np.linalg.pinv(S) @ y)
+
+#         return y, S, S_diag, nu, d2
+
+#     def _axiswise_gate(self, measurement):
+#         """
+#         逐轴判断 measurement 是否为离群值
+
+#         判据：
+#         1. normalized innovation 门限： |r_i| / sqrt(S_ii) <= threshold_i
+#         2. 如果设置了绝对残差门限，还要求： |r_i| <= abs_threshold_i
+
+#         Returns:
+#             accepted_mask: shape (3,), bool
+#             y: innovation, shape (3,)
+#             S: innovation covariance, shape (3,3)
+#             S_diag: diag(S), shape (3,)
+#             nu: normalized innovation, shape (3,)
+#             d2: full 3D squared Mahalanobis distance
+#         """
+#         y, S, S_diag, nu, d2 = self._compute_innovation_statistics(measurement)
+
+#         accepted_mask = (nu <= self.axis_gate_threshold)
+
+#         if self.axis_abs_residual_threshold is not None:
+#             accepted_mask = accepted_mask & (np.abs(y) <= self.axis_abs_residual_threshold)
+
+#         return accepted_mask, y, S, S_diag, nu, d2
+
+#     def predict(self):
+#         """预测步骤（考虑重力和二次空气阻力）"""
+#         if not self.initialized:
+#             return
+
+#         start_time = time.perf_counter() if self.verbose else None
+
+#         dt = self.dt
+#         pos = self.x[:3].copy()
+#         vel = self.x[3:].copy()
+
+#         # 重力加速度
+#         a_gravity = np.array([0.0, 0.0, -self.g], dtype=float)
+
+#         # 二次阻力加速度及其雅可比
+#         a_drag, J_drag = self._compute_drag_acceleration_and_jacobian(vel)
+
+#         # 总加速度
+#         a_total = a_gravity + a_drag
+
+#         # 非线性状态预测
+#         pos_new = pos + vel * dt + 0.5 * a_total * dt**2
+#         vel_new = vel + a_total * dt
+
+#         self.x[:3] = pos_new
+#         self.x[3:] = vel_new
+
+#         # 线性化雅可比
+#         I3 = np.eye(3, dtype=float)
+#         self.F = np.block([
+#             [I3, dt * I3 + 0.5 * dt**2 * J_drag],
+#             [np.zeros((3, 3), dtype=float), I3 + dt * J_drag]
+#         ])
+
+#         self.B = np.array(
+#             [0.0, 0.0, -0.5 * self.g * dt**2, 0.0, 0.0, -self.g * dt],
+#             dtype=float
+#         )
+
+#         # 协方差预测
+#         self.P = self.F @ self.P @ self.F.T + self.Q
+
+#         # 数值对称化
+#         self.P = 0.5 * (self.P + self.P.T)
+#         self.velocity_uncertainty = np.diag(self.P)[3:]
+
+#         if self.verbose:
+#             elapsed_time = (time.perf_counter() - start_time) * 1000.0
+#             print(f"[KF Predict] 耗时: {elapsed_time:.4f}ms")
+
+#     def update(self, measurement, current_time=None):
+#         """
+#         更新步骤（支持逐轴离群值拒绝 + 部分更新）
+
+#         Args:
+#             measurement: 观测值 [x, y, z]
+#             current_time: 当前时间（未使用，保留接口兼容性）
+
+#         Returns:
+#             accepted: bool
+#                 是否至少有一个轴被采纳用于更新
+#         """
+#         start_time = time.perf_counter() if self.verbose else None
+
+#         measurement = np.asarray(measurement, dtype=float)
+
+#         if not self.initialized:
+#             # 第一次观测：初始化，速度设为 0
+#             self.initialize(measurement, velocity=np.zeros(3, dtype=float))
+#             self.last_innovation = None
+#             self.last_innovation_S_diag = None
+#             self.last_normalized_innovation = None
+#             self.last_innovation_mahalanobis2 = None
+#             self.last_axis_accepted_mask = np.array([True, True, True], dtype=bool)
+#             self.last_update_accepted = True
+#             self.accepted_updates += 1
+#             self.consecutive_rejections = 0
+
+#             if self.verbose:
+#                 elapsed_time = (time.perf_counter() - start_time) * 1000.0
+#                 print(f"[KF Update-Init] 耗时: {elapsed_time:.4f}ms")
+#             return True
+
+#         # ----------------------------
+#         # 1) 计算创新统计 + 逐轴 gate
+#         # ----------------------------
+#         if self.enable_axiswise_outlier_rejection:
+#             accepted_mask, y, S, S_diag, nu, d2 = self._axiswise_gate(measurement)
+#         else:
+#             y, S, S_diag, nu, d2 = self._compute_innovation_statistics(measurement)
+#             accepted_mask = np.array([True, True, True], dtype=bool)
+
+#         # 保存诊断信息（基于 update 前的先验）
+#         self.last_innovation = y.copy()
+#         self.last_innovation_S_diag = S_diag.copy()
+#         self.last_normalized_innovation = nu.copy()
+#         self.last_innovation_mahalanobis2 = d2
+#         self.last_axis_accepted_mask = accepted_mask.copy()
+
+#         accepted_indices = np.where(accepted_mask)[0]
+
+#         # ----------------------------
+#         # 2) 如果三轴全拒绝，则整次更新拒绝
+#         # ----------------------------
+#         if len(accepted_indices) == 0:
+#             self.last_update_accepted = False
+#             self.rejected_updates += 1
+#             self.consecutive_rejections += 1
+
+#             if self.verbose:
+#                 elapsed_time = (time.perf_counter() - start_time) * 1000.0
+#                 print(
+#                     "[KF Update-Rejected-All] "
+#                     f"innovation={y}, "
+#                     f"normalized_innovation={nu}, "
+#                     f"耗时: {elapsed_time:.4f}ms"
+#                 )
+#             return False
+
+#         # ----------------------------
+#         # 3) 只用通过 gate 的轴做部分更新
+#         # ----------------------------
+#         H_sel = self.H[accepted_indices, :]                       # m x 6
+#         z_sel = measurement[accepted_indices]                    # m
+#         R_sel = self.R[np.ix_(accepted_indices, accepted_indices)]  # m x m
+
+#         y_sel = z_sel - H_sel @ self.x
+#         S_sel = H_sel @ self.P @ H_sel.T + R_sel
+
+#         PHt = self.P @ H_sel.T
+#         try:
+#             K = np.linalg.solve(S_sel.T, PHt.T).T
+#         except np.linalg.LinAlgError:
+#             K = PHt @ np.linalg.pinv(S_sel)
+
+#         # 状态更新
+#         self.x = self.x + K @ y_sel
+
+#         # Joseph form 协方差更新
+#         I = np.eye(6, dtype=float)
+#         KH = K @ H_sel
+#         self.P = (I - KH) @ self.P @ (I - KH).T + K @ R_sel @ K.T
+
+#         # 数值对称化
+#         self.P = 0.5 * (self.P + self.P.T)
+#         self.velocity_uncertainty = np.diag(self.P)[3:]
+
+#         # 统计
+#         self.update_count += 1
+#         self.accepted_updates += 1
+#         self.last_update_accepted = True
+#         self.consecutive_rejections = 0
+
+#         if len(accepted_indices) < 3:
+#             self.partial_updates += 1
+
+#         if self.verbose:
+#             elapsed_time = (time.perf_counter() - start_time) * 1000.0
+#             axis_names = ['x', 'y', 'z']
+#             accepted_axis_names = [axis_names[i] for i in accepted_indices]
+#             print(
+#                 f"[KF Update] accepted_axes={accepted_axis_names}, "
+#                 f"innovation={y}, "
+#                 f"normalized_innovation={nu}, "
+#                 f"耗时: {elapsed_time:.4f}ms"
+#             )
+
+#         return True
+
+#     def get_state(self):
+#         """获取当前状态"""
+#         if not self.initialized:
+#             return None
+
+#         p_diag = np.diag(self.P).astype(float)
+#         return {
+#             'position': self.x[:3].copy(),
+#             'velocity': self.x[3:].copy(),
+#             'full_state': self.x.copy(),
+#             'position_uncertainty': p_diag[:3].copy(),
+#             'velocity_uncertainty': self.velocity_uncertainty.copy(),
+
+#             'innovation_r': None if self.last_innovation is None else self.last_innovation.copy(),
+#             'innovation_S_diag': None if self.last_innovation_S_diag is None else self.last_innovation_S_diag.copy(),
+#             'normalized_innovation': None if self.last_normalized_innovation is None else self.last_normalized_innovation.copy(),
+#             'innovation_mahalanobis2': self.last_innovation_mahalanobis2,
+
+#             'axis_accepted_mask': None if self.last_axis_accepted_mask is None else self.last_axis_accepted_mask.copy(),
+#             'last_update_accepted': self.last_update_accepted,
+
+#             'update_count': self.update_count,
+#             'accepted_updates': self.accepted_updates,
+#             'rejected_updates': self.rejected_updates,
+#             'partial_updates': self.partial_updates,
+#             'consecutive_rejections': self.consecutive_rejections,
+#         }
+
+#     def predict_landing_position(self, z_threshold=0.15, min_updates=5, max_velocity_uncertainty=100.0):
+#         """
+#         预测小球落地时的位置
+
+#         Args:
+#             z_threshold: 地面高度阈值（米）
+#             min_updates: 最小有效更新次数
+#             max_velocity_uncertainty: 最大速度不确定性（协方差对角元素阈值）
+
+#         Returns:
+#             landing_pos: 落地位置 [x, y, z] 或 None
+#             landing_time: 落地时间（秒）或 None
+#         """
+#         if not self.initialized:
+#             return None, None
+
+#         if self.update_count < min_updates:
+#             return None, None
+
+#         velocity_uncertainty = np.diag(self.P)[3:]
+#         if np.any(velocity_uncertainty > max_velocity_uncertainty):
+#             return None, None
+
+#         pos = self.x[:3].copy()
+#         vel = self.x[3:].copy()
+
+#         if pos[2] <= z_threshold or np.linalg.norm(vel) < 1e-6:
+#             return None, None
+
+#         # 数值积分预测落地
+#         dt_sim = min(self.dt, 0.002)
+#         max_steps = 20000
+
+#         sim_pos = pos.copy()
+#         sim_vel = vel.copy()
+#         sim_time = 0.0
+
+#         prev_pos = sim_pos.copy()
+#         prev_time = sim_time
+
+#         for _ in range(max_steps):
+#             if sim_pos[2] <= z_threshold:
+#                 break
+
+#             prev_pos = sim_pos.copy()
+#             prev_time = sim_time
+
+#             speed = np.linalg.norm(sim_vel)
+#             if self.drag_coefficient > 0.0 and speed > 1e-12:
+#                 a_drag = -self.drag_coefficient * speed * sim_vel
+#             else:
+#                 a_drag = np.zeros(3, dtype=float)
+
+#             a_total = np.array([0.0, 0.0, -self.g], dtype=float) + a_drag
+
+#             sim_pos = sim_pos + sim_vel * dt_sim + 0.5 * a_total * dt_sim**2
+#             sim_vel = sim_vel + a_total * dt_sim
+#             sim_time += dt_sim
+
+#         if sim_pos[2] > z_threshold:
+#             return None, None
+
+#         # 线性插值过地面时刻
+#         z1 = prev_pos[2]
+#         z2 = sim_pos[2]
+
+#         if abs(z2 - z1) < 1e-12:
+#             alpha = 1.0
+#         else:
+#             alpha = (z_threshold - z1) / (z2 - z1)
+#             alpha = np.clip(alpha, 0.0, 1.0)
+
+#         landing_time = prev_time + alpha * (sim_time - prev_time)
+#         landing_pos = prev_pos + alpha * (sim_pos - prev_pos)
+#         landing_pos[2] = z_threshold
+
+#         return landing_pos, landing_time
+
+#     def reset(self):
+#         """重置滤波器"""
+#         self.x = np.zeros(6, dtype=float)
+#         self.P = np.eye(6, dtype=float) * 10.0
+#         self.velocity_uncertainty = np.diag(self.P)[3:]
+
+#         self.initialized = False
+#         self.update_count = 0
+
+#         self.rejected_updates = 0
+#         self.accepted_updates = 0
+#         self.partial_updates = 0
+#         self.consecutive_rejections = 0
+
+#         self.last_innovation = None
+#         self.last_innovation_S_diag = None
+#         self.last_normalized_innovation = None
+#         self.last_innovation_mahalanobis2 = None
+#         self.last_axis_accepted_mask = None
+#         self.last_update_accepted = None
+
+# soft gating 版本
 class KalmanFilter3D:
     """
-    简化版3D卡尔曼滤波器（纯观测驱动，无速度估计）
+    3D 卡尔曼滤波器（位置观测 + 速度状态，支持重力与二次空气阻力）
     状态向量: [x, y, z, vx, vy, vz]
+
+    特性：
+    1. 使用位置观测更新状态
+    2. 预测阶段考虑重力和二次空气阻力
+    3. x/y/z 三个方向分开做 robust gating
+    4. 每轴支持：
+       - 正常更新
+       - 弱更新（增大该轴测量噪声）
+       - 硬拒绝
+    5. 三轴全拒绝时不会彻底锁死，而是膨胀协方差，方便后续重新拉回
     """
-    
-    def __init__(self, dt=0.002, g=9.8, process_noise=0.1, measurement_noise=0.05, drag_coefficient=0.0, verbose=False):
+
+    def __init__(self, kalman_config=None):
         """
-        初始化卡尔曼滤波器
-        
+        初始化滤波器
+
         Args:
-            dt: 时间步长（秒）
-            g: 重力加速度（m/s²）
-            process_noise: 过程噪声标准差（加速度噪声标准差，单位 m/s²）
-            measurement_noise: 测量噪声标准差（位置测量标准差，单位 m）
-            drag_coefficient: 空气阻力系数（二次阻力模型中的 k，单位 1/m）
-                             满足 a_drag = -k * ||v|| * v
-            verbose: 是否打印详细日志
+            kalman_config: 卡尔曼滤波器配置
+
         """
+        # 只解析 kalman 子集；兼容两种传法：
+        # 1) 直接传 kalman 字典
+        # 2) 传包含 kalman 键的上层字典
+        cfg_src = kalman_config if isinstance(kalman_config, dict) else {}
+        kalman_cfg = cfg_src.get('kalman', cfg_src)
+
+        dt = kalman_cfg.get('dt', cfg_src.get('dt'))
+        verbose = kalman_cfg.get('verbose', cfg_src.get('verbose'))
+        g = kalman_cfg.get('g', cfg_src.get('g'))
+        process_noise = kalman_cfg.get('process_noise', cfg_src.get('process_noise'))
+        measurement_noise = kalman_cfg.get('measurement_noise', cfg_src.get('measurement_noise'))
+        drag_coefficient = kalman_cfg.get('drag_coefficient', cfg_src.get('drag_coefficient'))
+        enable_axiswise_outlier_rejection = kalman_cfg.get(
+            'enable_axiswise_outlier_rejection',
+            cfg_src.get('enable_axiswise_outlier_rejection'),
+        )
+        axis_soft_gate_threshold = kalman_cfg.get(
+            'axis_soft_gate_threshold',
+            cfg_src.get('axis_soft_gate_threshold'),
+        )
+        axis_hard_gate_threshold = kalman_cfg.get(
+            'axis_hard_gate_threshold',
+            cfg_src.get('axis_hard_gate_threshold'),
+        )
+        axis_abs_residual_threshold = kalman_cfg.get(
+            'axis_abs_residual_threshold',
+            cfg_src.get('axis_abs_residual_threshold'),
+        )
+        if isinstance(axis_abs_residual_threshold, str) and axis_abs_residual_threshold.strip().lower() in {
+            'none', 'null', '~', ''
+        }:
+            axis_abs_residual_threshold = None
+        min_soft_weight = kalman_cfg.get('min_soft_weight', cfg_src.get('min_soft_weight'))
+        rejection_cov_inflation = kalman_cfg.get(
+            'rejection_cov_inflation',
+            cfg_src.get('rejection_cov_inflation'),
+        )
+        rejection_position_inflate_std = kalman_cfg.get(
+            'rejection_position_inflate_std',
+            cfg_src.get('rejection_position_inflate_std'),
+        )
+        rejection_velocity_inflate_std = kalman_cfg.get(
+            'rejection_velocity_inflate_std',
+            cfg_src.get('rejection_velocity_inflate_std'),
+        )
+
+        required = {
+            'dt': dt,
+            'verbose': verbose,
+            'g': g,
+            'process_noise': process_noise,
+            'measurement_noise': measurement_noise,
+            'drag_coefficient': drag_coefficient,
+            'enable_axiswise_outlier_rejection': enable_axiswise_outlier_rejection,
+            'axis_soft_gate_threshold': axis_soft_gate_threshold,
+            'axis_hard_gate_threshold': axis_hard_gate_threshold,
+            'min_soft_weight': min_soft_weight,
+            'rejection_cov_inflation': rejection_cov_inflation,
+            'rejection_position_inflate_std': rejection_position_inflate_std,
+            'rejection_velocity_inflate_std': rejection_velocity_inflate_std,
+        }
+        missing = [k for k, v in required.items() if v is None]
+        if missing:
+            raise KeyError(f"KalmanFilter3D 配置缺失: {missing}")
+
         self.dt = dt
         self.g = g
         self.drag_coefficient = drag_coefficient
         self.verbose = verbose
-        
+
+        self.enable_axiswise_outlier_rejection = enable_axiswise_outlier_rejection
+
+        self.axis_soft_gate_threshold = np.asarray(axis_soft_gate_threshold, dtype=float).reshape(3)
+        self.axis_hard_gate_threshold = np.asarray(axis_hard_gate_threshold, dtype=float).reshape(3)
+
+        if np.any(self.axis_hard_gate_threshold < self.axis_soft_gate_threshold):
+            raise ValueError("axis_hard_gate_threshold 必须逐轴 >= axis_soft_gate_threshold")
+
+        if axis_abs_residual_threshold is None:
+            self.axis_abs_residual_threshold = None
+        else:
+            self.axis_abs_residual_threshold = np.asarray(
+                axis_abs_residual_threshold, dtype=float
+            ).reshape(3)
+
+        self.min_soft_weight = float(min_soft_weight)
+        self.rejection_cov_inflation = np.asarray(rejection_cov_inflation, dtype=float).reshape(3)
+        self.rejection_position_inflate_std = np.asarray(
+            rejection_position_inflate_std, dtype=float
+        ).reshape(3)
+        self.rejection_velocity_inflate_std = np.asarray(
+            rejection_velocity_inflate_std, dtype=float
+        ).reshape(3)
+
         # 状态向量 [x, y, z, vx, vy, vz]
         self.x = np.zeros(6, dtype=float)
-        
+
         # 状态协方差矩阵
         self.P = np.eye(6, dtype=float) * 10.0
-        self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
-        
-        # 基础状态转移矩阵（保留变量名；实际 predict 时会构造线性化后的 self.F）
+        self.velocity_uncertainty = np.diag(self.P)[3:]
+
+        # 基础状态转移矩阵（predict 时会线性化更新）
         self.F = np.array([
             [1, 0, 0, dt, 0, 0],
             [0, 1, 0, 0, dt, 0],
@@ -160,292 +1143,484 @@ class KalmanFilter3D:
             [0, 0, 0, 0, 1, 0],
             [0, 0, 0, 0, 0, 1]
         ], dtype=float)
-        
-        # 控制输入矩阵（保留变量名；predict 里仍会更新使用）
+
+        # 保留变量名 B
         self.B = np.array([0, 0, -0.5 * g * dt**2, 0, 0, -g * dt], dtype=float)
-        
+
         # 观测矩阵（只观测位置）
         self.H = np.array([
-            [1, 0, 0, 0, 0, 0],
-            [0, 1, 0, 0, 0, 0],
-            [0, 0, 1, 0, 0, 0]
+            [1, 0, 0, 0, 0, 0],  # x
+            [0, 1, 0, 0, 0, 0],  # y
+            [0, 0, 1, 0, 0, 0],  # z
         ], dtype=float)
-        
-        # 过程噪声协方差 Q（6×6，基于加速度扰动模型）
-        if isinstance(process_noise, (list, np.ndarray)):
-            sigma_a = np.array(process_noise, dtype=float).reshape(3)  # [ax, ay, az]
+
+        # 过程噪声协方差 Q
+        if isinstance(process_noise, (list, tuple, np.ndarray)):
+            sigma_a = np.array(process_noise, dtype=float).reshape(3)
         else:
             sigma_a = np.full(3, process_noise, dtype=float)
-        
-        Da = np.diag(sigma_a ** 2)   # 3×3 加速度扰动协方差
-        Q_pp = (dt**4 / 4.0) * Da    # 位置-位置块
-        Q_pv = (dt**3 / 2.0) * Da    # 位置-速度块
-        Q_vv = (dt**2) * Da          # 速度-速度块
+
+        Da = np.diag(sigma_a ** 2)
+        Q_pp = (dt**4 / 4.0) * Da
+        Q_pv = (dt**3 / 2.0) * Da
+        Q_vv = (dt**2) * Da
         self.Q = np.block([
             [Q_pp, Q_pv],
             [Q_pv, Q_vv]
         ]).astype(float)
-        
-        # 测量噪声协方差 R（3×3，各向异性）
-        if isinstance(measurement_noise, (list, np.ndarray)):
-            sigma_m = np.array(measurement_noise, dtype=float).reshape(3)  # [mx, my, mz]
+
+        # 测量噪声协方差 R
+        if isinstance(measurement_noise, (list, tuple, np.ndarray)):
+            sigma_m = np.array(measurement_noise, dtype=float).reshape(3)
         else:
             sigma_m = np.full(3, measurement_noise, dtype=float)
-        
+
         self.R = np.diag(sigma_m ** 2).astype(float)
-        
+
         self.initialized = False
-        self.update_count = 0  # 记录更新次数，用于判断速度估计是否可靠
-        
+        self.update_count = 0  # 至少有一个轴被采纳才算有效更新
+
+        # 统计信息
+        self.rejected_updates = 0
+        self.accepted_updates = 0
+        self.partial_updates = 0
+        self.consecutive_rejections = 0
+
+        # 最近一次创新统计（基于 update 前先验）
+        self.last_innovation = None
+        self.last_innovation_S_diag = None
+        self.last_normalized_innovation = None
+        self.last_innovation_mahalanobis2 = None
+
+        # 最近一次 gating / update 结果
+        self.last_axis_weights = None           # shape (3,), in [0,1]
+        self.last_axis_accepted_mask = None     # shape (3,), bool
+        self.last_update_accepted = None        # bool，是否至少有一个轴被采纳
+
     def initialize(self, position, velocity=None):
         """
         初始化滤波器状态
-        
+
         Args:
             position: 初始位置 [x, y, z]
             velocity: 初始速度 [vx, vy, vz]，默认为0
         """
         if velocity is None:
             velocity = np.zeros(3, dtype=float)
-        
+
         self.x[:3] = np.asarray(position, dtype=float)
         self.x[3:] = np.asarray(velocity, dtype=float)
-        
-        # 初始协方差：位置较确定，速度不确定
+
+        # 初始协方差：位置较确定，速度稍不确定
         self.P = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]).astype(float)
-        self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
-        
+        self.velocity_uncertainty = np.diag(self.P)[3:]
+
         self.initialized = True
-    
+
     def _compute_drag_acceleration_and_jacobian(self, velocity):
         """
         计算二次阻力加速度及其对速度的雅可比
-        
+
         a_drag = -k * ||v|| * v
-        
+
         Returns:
             a_drag: shape (3,)
-            J_drag: da_drag / dv, shape (3,3)
+            J_drag: shape (3,3)
         """
         v = np.asarray(velocity, dtype=float)
         speed = np.linalg.norm(v)
         k = self.drag_coefficient
-        
+
         if k <= 0.0 or speed < 1e-12:
             a_drag = np.zeros(3, dtype=float)
             J_drag = np.zeros((3, 3), dtype=float)
             return a_drag, J_drag
-        
-        # 二次阻力加速度
+
         a_drag = -k * speed * v
-        
-        # 雅可比：
-        # d/dv ( ||v|| v ) = ||v|| I + (v v^T)/||v||
+
         I3 = np.eye(3, dtype=float)
         outer_v = np.outer(v, v)
         J_drag = -k * (speed * I3 + outer_v / speed)
-        
+
         return a_drag, J_drag
-        
+
+    def _compute_innovation_statistics(self, measurement):
+        """
+        计算完整 3 维观测的创新统计（基于 update 前先验状态）
+
+        Returns:
+            y: innovation, shape (3,)
+            S: innovation covariance, shape (3,3)
+            S_diag: diag(S), shape (3,)
+            nu: normalized innovation, shape (3,)
+            d2: full 3D squared Mahalanobis distance
+        """
+        measurement = np.asarray(measurement, dtype=float)
+
+        y = measurement - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+
+        S_diag = np.diag(S).astype(float)
+        S_diag_safe = np.maximum(S_diag, 1e-12)
+        nu = np.abs(y) / np.sqrt(S_diag_safe)
+
+        try:
+            Sinv_y = np.linalg.solve(S, y)
+            d2 = float(y.T @ Sinv_y)
+        except np.linalg.LinAlgError:
+            d2 = float(y.T @ np.linalg.pinv(S) @ y)
+
+        return y, S, S_diag, nu, d2
+
+    def _compute_axis_weights(self, y, S_diag, nu):
+        """
+        根据逐轴 innovation 计算每轴权重
+
+        返回:
+            weights: shape (3,), 每轴权重
+                1.0  -> 正常更新
+                (0,1)-> 弱更新
+                0.0  -> 硬拒绝
+        """
+        weights = np.ones(3, dtype=float)
+
+        soft = self.axis_soft_gate_threshold
+        hard = self.axis_hard_gate_threshold
+
+        for i in range(3):
+            if nu[i] <= soft[i]:
+                weights[i] = 1.0
+            elif nu[i] <= hard[i]:
+                # 软衰减：越离谱，权重越小
+                weights[i] = max((soft[i] / max(nu[i], 1e-12)) ** 2, self.min_soft_weight)
+            else:
+                weights[i] = 0.0
+
+        # 绝对残差硬拒绝
+        if self.axis_abs_residual_threshold is not None:
+            abs_reject = np.abs(y) > self.axis_abs_residual_threshold
+            weights[abs_reject] = 0.0
+
+        return weights
+
+    def _inflate_covariance_after_full_rejection(self):
+        """
+        三轴全拒绝时，对协方差做适度膨胀，避免滤波器锁死。
+        """
+        pos_std = self.rejection_position_inflate_std * self.rejection_cov_inflation
+        vel_std = self.rejection_velocity_inflate_std * self.rejection_cov_inflation
+
+        pos_inflate = np.diag(pos_std ** 2)
+        vel_inflate = np.diag(vel_std ** 2)
+
+        self.P[:3, :3] += pos_inflate
+        self.P[3:, 3:] += vel_inflate
+
+        self.P = 0.5 * (self.P + self.P.T)
+        self.velocity_uncertainty = np.diag(self.P)[3:]
+
     def predict(self):
         """预测步骤（考虑重力和二次空气阻力）"""
         if not self.initialized:
             return
-        
+
         start_time = time.perf_counter() if self.verbose else None
-        
+
         dt = self.dt
         pos = self.x[:3].copy()
         vel = self.x[3:].copy()
-        
-        # 重力加速度
+
         a_gravity = np.array([0.0, 0.0, -self.g], dtype=float)
-        
-        # 二次阻力加速度及其雅可比
         a_drag, J_drag = self._compute_drag_acceleration_and_jacobian(vel)
-        
-        # 总加速度
         a_total = a_gravity + a_drag
-        
-        # 状态预测（非线性）
+
+        # 非线性状态预测
         pos_new = pos + vel * dt + 0.5 * a_total * dt**2
         vel_new = vel + a_total * dt
-        
+
         self.x[:3] = pos_new
         self.x[3:] = vel_new
-        
-        # 用当前位置线性化后的雅可比传播协方差
-        # p_{k+1} = p_k + v_k dt + 0.5 a(v_k) dt^2
-        # v_{k+1} = v_k + a(v_k) dt
-        #
-        # 因此：
-        # d p_{k+1}/d v_k = dt I + 0.5 dt^2 J_drag
-        # d v_{k+1}/d v_k = I + dt J_drag
+
+        # 线性化雅可比
         I3 = np.eye(3, dtype=float)
         self.F = np.block([
             [I3, dt * I3 + 0.5 * dt**2 * J_drag],
             [np.zeros((3, 3), dtype=float), I3 + dt * J_drag]
         ])
-        
-        # 保留变量名 B，但此时重力和阻力已经直接进了非线性状态更新
-        self.B = np.array([0.0, 0.0, -0.5 * self.g * dt**2, 0.0, 0.0, -self.g * dt], dtype=float)
-        
+
+        self.B = np.array(
+            [0.0, 0.0, -0.5 * self.g * dt**2, 0.0, 0.0, -self.g * dt],
+            dtype=float
+        )
+
         # 协方差预测
         self.P = self.F @ self.P @ self.F.T + self.Q
-        
-        # 数值对称化，避免浮点误差把协方差搞歪
         self.P = 0.5 * (self.P + self.P.T)
-        self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
-        
+        self.velocity_uncertainty = np.diag(self.P)[3:]
+
         if self.verbose:
             elapsed_time = (time.perf_counter() - start_time) * 1000.0
             print(f"[KF Predict] 耗时: {elapsed_time:.4f}ms")
-        
+
     def update(self, measurement, current_time=None):
         """
-        更新步骤（简化版：纯卡尔曼更新，无额外速度估计）
-        
+        更新步骤（逐轴 soft/hard gating + 弱更新）
+
         Args:
             measurement: 观测值 [x, y, z]
-            current_time: 当前时间（未使用，保留接口兼容性）
+            current_time: 当前时间（保留接口兼容性）
+
+        Returns:
+            accepted: bool
+                是否至少有一个轴被采纳用于更新
         """
         start_time = time.perf_counter() if self.verbose else None
-        
+
         measurement = np.asarray(measurement, dtype=float)
-        
+
         if not self.initialized:
-            # 第一次观测：初始化，速度设为0
             self.initialize(measurement, velocity=np.zeros(3, dtype=float))
+
+            self.last_innovation = None
+            self.last_innovation_S_diag = None
+            self.last_normalized_innovation = None
+            self.last_innovation_mahalanobis2 = None
+            self.last_axis_weights = np.ones(3, dtype=float)
+            self.last_axis_accepted_mask = np.array([True, True, True], dtype=bool)
+            self.last_update_accepted = True
+
+            self.accepted_updates += 1
+            self.consecutive_rejections = 0
+
             if self.verbose:
                 elapsed_time = (time.perf_counter() - start_time) * 1000.0
                 print(f"[KF Update-Init] 耗时: {elapsed_time:.4f}ms")
-            return
-        
-        # 标准卡尔曼更新
-        y = measurement - self.H @ self.x
-        S = self.H @ self.P @ self.H.T + self.R
-        
-        # 卡尔曼增益（避免显式求逆）
-        PHt = self.P @ self.H.T
-        K = np.linalg.solve(S.T, PHt.T).T
-        
-        # 状态更新
-        self.x = self.x + K @ y
-        
+            return True
+
+        # 1) 完整创新统计
+        y, S, S_diag, nu, d2 = self._compute_innovation_statistics(measurement)
+
+        self.last_innovation = y.copy()
+        self.last_innovation_S_diag = S_diag.copy()
+        self.last_normalized_innovation = nu.copy()
+        self.last_innovation_mahalanobis2 = d2
+
+        # 2) 逐轴权重：1=正常更新, (0,1)=弱更新, 0=拒绝
+        if self.enable_axiswise_outlier_rejection:
+            weights = self._compute_axis_weights(y, S_diag, nu)
+        else:
+            weights = np.ones(3, dtype=float)
+
+        accepted_mask = weights > 0.0
+
+        self.last_axis_weights = weights.copy()
+        self.last_axis_accepted_mask = accepted_mask.copy()
+
+        accepted_indices = np.where(accepted_mask)[0]
+
+        # 3) 三轴全拒绝：不更新，但膨胀协方差，防止锁死
+        if len(accepted_indices) == 0:
+            self.last_update_accepted = False
+            self.rejected_updates += 1
+            self.consecutive_rejections += 1
+
+            self._inflate_covariance_after_full_rejection()
+
+            if self.verbose:
+                elapsed_time = (time.perf_counter() - start_time) * 1000.0
+                print(
+                    "[KF Update-Rejected-All] "
+                    f"innovation={y}, "
+                    f"normalized_innovation={nu}, "
+                    f"耗时: {elapsed_time:.4f}ms"
+                )
+            return False
+
+        # 4) 只取被接受的轴，并对弱更新轴增大等效 R
+        H_sel = self.H[accepted_indices, :]
+        z_sel = measurement[accepted_indices]
+        y_sel = z_sel - H_sel @ self.x
+
+        R_diag = np.diag(self.R).astype(float)
+        R_eff_diag = []
+
+        for idx in accepted_indices:
+            # 权重越小，等效测量噪声越大，表示“少信一点”
+            R_eff_diag.append(R_diag[idx] / max(weights[idx], 1e-12))
+
+        R_eff = np.diag(R_eff_diag)
+        S_sel = H_sel @ self.P @ H_sel.T + R_eff
+
+        PHt = self.P @ H_sel.T
+        try:
+            K = np.linalg.solve(S_sel.T, PHt.T).T
+        except np.linalg.LinAlgError:
+            K = PHt @ np.linalg.pinv(S_sel)
+
+        # 5) 状态更新
+        self.x = self.x + K @ y_sel
+
         # Joseph form 协方差更新
         I = np.eye(6, dtype=float)
-        KH = K @ self.H
-        self.P = (I - KH) @ self.P @ (I - KH).T + K @ self.R @ K.T
-        
-        # 数值对称化
+        KH = K @ H_sel
+        self.P = (I - KH) @ self.P @ (I - KH).T + K @ R_eff @ K.T
         self.P = 0.5 * (self.P + self.P.T)
-        self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
+        self.velocity_uncertainty = np.diag(self.P)[3:]
 
-        # 增加更新计数
+        # 统计量
         self.update_count += 1
-        
+        self.accepted_updates += 1
+        self.last_update_accepted = True
+        self.consecutive_rejections = 0
+
+        if len(accepted_indices) < 3 or np.any(weights[accepted_indices] < 0.999):
+            self.partial_updates += 1
+
         if self.verbose:
             elapsed_time = (time.perf_counter() - start_time) * 1000.0
-            print(f"[KF Update] 耗时: {elapsed_time:.4f}ms")
-        
+            axis_names = ['x', 'y', 'z']
+            accepted_axis_names = [axis_names[i] for i in accepted_indices]
+            print(
+                f"[KF Update] accepted_axes={accepted_axis_names}, "
+                f"weights={weights}, "
+                f"innovation={y}, "
+                f"normalized_innovation={nu}, "
+                f"耗时: {elapsed_time:.4f}ms"
+            )
+
+        return True
+
     def get_state(self):
         """获取当前状态"""
         if not self.initialized:
-            return None  # 未初始化时返回None,而不是全0状态
+            return None
+
+        p_diag = np.diag(self.P).astype(float)
+
         return {
             'position': self.x[:3].copy(),
             'velocity': self.x[3:].copy(),
             'full_state': self.x.copy(),
-            'velocity_uncertainty': self.velocity_uncertainty.copy()
+
+            'position_uncertainty': p_diag[:3].copy(),
+            'velocity_uncertainty': self.velocity_uncertainty.copy(),
+
+            'innovation_r': None if self.last_innovation is None else self.last_innovation.copy(),
+            'innovation_S_diag': None if self.last_innovation_S_diag is None else self.last_innovation_S_diag.copy(),
+            'normalized_innovation': None if self.last_normalized_innovation is None else self.last_normalized_innovation.copy(),
+            'innovation_mahalanobis2': self.last_innovation_mahalanobis2,
+
+            'axis_weights': None if self.last_axis_weights is None else self.last_axis_weights.copy(),
+            'axis_accepted_mask': None if self.last_axis_accepted_mask is None else self.last_axis_accepted_mask.copy(),
+            'last_update_accepted': self.last_update_accepted,
+
+            'update_count': self.update_count,
+            'accepted_updates': self.accepted_updates,
+            'rejected_updates': self.rejected_updates,
+            'partial_updates': self.partial_updates,
+            'consecutive_rejections': self.consecutive_rejections,
         }
-    
+
     def predict_landing_position(self, z_threshold=0.15, min_updates=5, max_velocity_uncertainty=100.0):
         """
         预测小球落地时的位置
-        
+
         Args:
             z_threshold: 地面高度阈值（米）
-            min_updates: 最小更新次数（用于判断速度估计是否可靠）
-            max_velocity_uncertainty: 最大速度不确定性（协方差对角元素的阈值）
-        
+            min_updates: 最小有效更新次数
+            max_velocity_uncertainty: 最大速度不确定性（协方差对角元素阈值）
+
         Returns:
-            landing_pos: 落地位置 [x, y, z] 或 None（如果无法预测）
+            landing_pos: 落地位置 [x, y, z] 或 None
             landing_time: 落地时间（秒）或 None
         """
         if not self.initialized:
             return None, None
-        
+
         if self.update_count < min_updates:
             return None, None
-        
-        velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
+
+        velocity_uncertainty = np.diag(self.P)[3:]
         if np.any(velocity_uncertainty > max_velocity_uncertainty):
             return None, None
-        
+
         pos = self.x[:3].copy()
         vel = self.x[3:].copy()
-        
+
         if pos[2] <= z_threshold or np.linalg.norm(vel) < 1e-6:
             return None, None
-        
-        # 为了不改变你的对外接口，这里返回格式保持不变
-        # 但因为现在模型已是二次阻力，解析抛体公式就不再严格成立
-        # 所以这里改成数值积分预测落地
+
+        # 数值积分预测落地
         dt_sim = min(self.dt, 0.002)
         max_steps = 20000
-        
+
         sim_pos = pos.copy()
         sim_vel = vel.copy()
         sim_time = 0.0
-        
+
         prev_pos = sim_pos.copy()
         prev_time = sim_time
-        
+
         for _ in range(max_steps):
             if sim_pos[2] <= z_threshold:
                 break
-            
+
             prev_pos = sim_pos.copy()
             prev_time = sim_time
-            
+
             speed = np.linalg.norm(sim_vel)
             if self.drag_coefficient > 0.0 and speed > 1e-12:
                 a_drag = -self.drag_coefficient * speed * sim_vel
             else:
                 a_drag = np.zeros(3, dtype=float)
-            
+
             a_total = np.array([0.0, 0.0, -self.g], dtype=float) + a_drag
-            
+
             sim_pos = sim_pos + sim_vel * dt_sim + 0.5 * a_total * dt_sim**2
             sim_vel = sim_vel + a_total * dt_sim
             sim_time += dt_sim
-        
+
         if sim_pos[2] > z_threshold:
             return None, None
-        
+
         # 线性插值过地面时刻
         z1 = prev_pos[2]
         z2 = sim_pos[2]
-        
+
         if abs(z2 - z1) < 1e-12:
             alpha = 1.0
         else:
             alpha = (z_threshold - z1) / (z2 - z1)
             alpha = np.clip(alpha, 0.0, 1.0)
-        
+
         landing_time = prev_time + alpha * (sim_time - prev_time)
         landing_pos = prev_pos + alpha * (sim_pos - prev_pos)
         landing_pos[2] = z_threshold
-        
+
         return landing_pos, landing_time
-    
+
     def reset(self):
         """重置滤波器"""
         self.x = np.zeros(6, dtype=float)
         self.P = np.eye(6, dtype=float) * 10.0
-        self.velocity_uncertainty = np.diag(self.P)[3:]  # 取速度分量的方差
+        self.velocity_uncertainty = np.diag(self.P)[3:]
+
         self.initialized = False
         self.update_count = 0
+
+        self.rejected_updates = 0
+        self.accepted_updates = 0
+        self.partial_updates = 0
+        self.consecutive_rejections = 0
+
+        self.last_innovation = None
+        self.last_innovation_S_diag = None
+        self.last_normalized_innovation = None
+        self.last_innovation_mahalanobis2 = None
+
+        self.last_axis_weights = None
+        self.last_axis_accepted_mask = None
+        self.last_update_accepted = None
 
 
 class MultiRedBallDetector:
@@ -456,19 +1631,50 @@ class MultiRedBallDetector:
     检测器通过识别非黑色区域的轮廓来检测球体。
     """
     
-    def __init__(self):
+    def __init__(self, detector_config=None):
         """初始化检测器参数"""
+        # 分层配置：优先读取 detector 子集；兼容直接传 detector 字典或旧平铺键
+        cfg_src = detector_config if isinstance(detector_config, dict) else {}
+        detector_cfg = cfg_src.get('detector', cfg_src)
+
+        center_border_pixels = detector_cfg.get(
+            'center_border_pixels',
+            cfg_src.get('center_border_pixels'),
+        )
+        min_area = detector_cfg.get(
+            'min_area',
+            cfg_src.get('detector_min_area'),
+        )
+        max_area = detector_cfg.get(
+            'max_area',
+            cfg_src.get('detector_max_area'),
+        )
+        min_circularity = detector_cfg.get(
+            'min_circularity',
+            cfg_src.get('detector_min_circularity'),
+        )
+
+        required = {
+            'center_border_pixels': center_border_pixels,
+            'min_area': min_area,
+            'max_area': max_area,
+            'min_circularity': min_circularity,
+        }
+        missing = [k for k, v in required.items() if v is None]
+        if missing:
+            raise KeyError(f"MultiRedBallDetector 配置缺失: {missing}")
+
         # 形态学操作的核
         self.open_kernel = np.ones((21, 21), np.uint8)
         self.close_kernel = np.ones((21, 21), np.uint8)
         
         # 球体形状约束
-        self.min_area = 500  # 最小面积
-        self.max_area = 9000  # 最大面积
-        self.min_circularity = 0.5  # 最小圆形度（与zed_image_saver.py保持一致）
+        self.min_area = int(min_area)  # 最小面积
+        self.max_area = int(max_area)  # 最大面积
+        self.min_circularity = float(min_circularity) # 最小圆形度（与zed_image_saver.py保持一致）
 
-        # 底部屏蔽区域（不做detect）
-        self.ignore_bottom_rows = IGNORE_BOTTOM_ROWS
+        # center有效区域边框（四周边框内的center判为无效）
+        self.center_border_pixels = int(center_border_pixels)
     
     def detect_all(self, image, camera_intrinsics=None, depth_image=None, center_method="min_depth"):
         """
@@ -496,11 +1702,6 @@ class MultiRedBallDetector:
         # 阈值设为1，将所有非完全黑色的像素识别为前景
         _, binary = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
 
-        # 屏蔽图像最下面N行，不参与检测
-        if self.ignore_bottom_rows > 0:
-            h = binary.shape[0]
-            cut_y = max(h - self.ignore_bottom_rows, 0)
-            binary[cut_y:, :] = 0
         
         # 形态学操作，去除噪声
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, self.open_kernel)
@@ -700,7 +1901,32 @@ class MultiRedBallDetector:
                     intersection = center
       
                 
-                
+               
+                # center有效性校验
+                if center is None:
+                    continue
+
+                cx, cy = int(center[0]), int(center[1])
+
+                # 先校验center是否在画线范围内（左右/上下极值线围成区域）
+                x_min, x_max = int(leftmost[0]), int(rightmost[0])
+                y_min, y_max = int(topmost[1]), int(bottommost[1])
+                if not (x_min <= cx <= x_max and y_min <= cy <= y_max):
+                    continue
+
+                # center边框校验：center落在图像四周边框圈内，视为无效检测
+                h, w = binary.shape[:2]
+                b = int(self.center_border_pixels)
+                b = max(0, min(b, h // 2, w // 2))
+                if b > 0 and (cx < b or cx >= (w - b) or cy < b or cy >= (h - b)):
+                    continue
+
+                # center必须在轮廓内（或边界上）
+                if cv2.pointPolygonTest(contour, (float(cx), float(cy)), False) < 0:
+                    continue
+
+                center = (cx, cy)
+
                 # 计算综合评分（用于兼容性）
                 score = circularity
                 
@@ -742,37 +1968,67 @@ class BallTracker:
     - w_history: 历史一致性权重（默认0.2）
     """
     
-    def __init__(self, num_balls=3, dt=0.002, g=9.8093, 
-                 process_noise=0.0001, measurement_noise=0.03,
-                 max_distance=0.5, drag_coefficient=0.0, verbose=False):
+    def __init__(self, tracker_config=None):
         """
         初始化多球追踪器
         
         Args:
-            num_balls: 球的数量
-            dt: 时间步长
-            g: 重力加速度
-            process_noise: 过程噪声标准差
-            measurement_noise: 测量噪声标准差
-            max_distance: 最大匹配距离（米），超过此距离认为不匹配
-            drag_coefficient: 空气阻力系数（默认0.0表示无阻力）
-            verbose: 是否打印详细日志
+            tracker_config: tracker参数字典（所有参数从此字典解析）
         """
+        cfg = tracker_config or {}
+
+        # 分层配置子集（支持新结构；同时兼容旧的平铺键）
+        runtime_cfg = cfg.get('runtime', {})
+        association_cfg = cfg.get('association', {})
+
+        num_balls = runtime_cfg.get('num_balls', cfg.get('num_balls'))
+        dt = runtime_cfg.get('dt', cfg.get('dt'))
+        verbose = runtime_cfg.get('verbose', cfg.get('verbose'))
+        required_detections = runtime_cfg.get('required_detections', cfg.get('required_detections'))
+
+        max_distance = association_cfg.get('max_distance', cfg.get('max_distance'))
+        w_position = association_cfg.get('w_position', cfg.get('w_position'))
+        w_speed = association_cfg.get('w_speed', cfg.get('w_speed'))
+        w_direction = association_cfg.get('w_direction', cfg.get('w_direction'))
+
+        required = {
+            'num_balls': num_balls,
+            'dt': dt,
+            'verbose': verbose,
+            'required_detections': required_detections,
+            'max_distance': max_distance,
+            'w_position': w_position,
+            'w_speed': w_speed,
+            'w_direction': w_direction,
+        }
+        missing = [k for k, v in required.items() if v is None]
+        if missing:
+            raise KeyError(f"BallTracker 配置缺失: {missing}")
+
         self.num_balls = num_balls
         self.dt = dt
         self.max_distance = max_distance
         self.verbose = verbose
+        self.w_position = float(w_position)
+        self.w_speed = float(w_speed)
+        self.w_direction = float(w_direction)
         
+        # 归一化并按子集下发配置（避免下游类依赖无关配置层）
+        detector_cfg = cfg.get('detector', {}) if isinstance(cfg.get('detector', {}), dict) else {}
+   
+
+        kalman_cfg = cfg.get('kalman', {}) if isinstance(cfg.get('kalman', {}), dict) else {}
+        if 'dt' not in kalman_cfg:
+            kalman_cfg['dt'] = dt
+        if 'verbose' not in kalman_cfg:
+            kalman_cfg['verbose'] = verbose
+
         # 创建球检测器
-        self.detector = MultiRedBallDetector()
-        
+        self.detector = MultiRedBallDetector(detector_config=detector_cfg)
+
         # 为每个球创建独立的卡尔曼滤波器
         self.kf_filters = [
-            KalmanFilter3D(dt=dt, g=g, 
-                          process_noise=process_noise, 
-                          measurement_noise=measurement_noise,
-                          drag_coefficient=drag_coefficient,
-                          verbose=verbose)
+            KalmanFilter3D(kalman_config=kalman_cfg)
             for _ in range(num_balls)
         ]
         
@@ -782,12 +2038,7 @@ class BallTracker:
         # 首次观测验证状态
         self.consecutive_detections = [0] * num_balls  # 连续检测计数器
         self.ever_validated = [False] * num_balls      # 是否曾经通过5帧验证（True=已验证，False=第一次观测需验证）
-        self.required_detections = 2  # 首次观测需要连续检测的帧数
-        
-        # 历史信息（用于匹配）
-        self.position_history = [[] for _ in range(num_balls)]  # 位置历史
-        self.velocity_history = [[] for _ in range(num_balls)]  # 速度历史
-        self.history_length = 10  # 保留的历史长度
+        self.required_detections = int(required_detections)  # 首次观测需要连续检测的帧数
         
         # 轨迹数据（用于可视化）
         self.kf_trajectories = [[] for _ in range(num_balls)]  # 卡尔曼滤波轨迹
@@ -844,17 +2095,68 @@ class BallTracker:
         if num_detections == 0:
             return {}
         
-        # 构建代价矩阵（与update方法相同的逻辑）
+        # 先估计每个 detection 对应的速度（与 update() 同一逻辑）
+        detection_velocities = []
+        for det_idx in range(num_detections):
+            best_velocity = None
+            min_dist = float('inf')
+
+            for tracker_id in range(self.num_balls):
+                if self.kf_filters[tracker_id].initialized:
+                    state = self.kf_filters[tracker_id].get_state()
+                    predicted_pos = state['position']
+                    predicted_vel = state['velocity']
+
+                    dist = np.linalg.norm(detections[det_idx] - predicted_pos)
+                    if dist < min_dist and dist < self.max_distance:
+                        min_dist = dist
+                        best_velocity = predicted_vel
+
+            detection_velocities.append(best_velocity)
+
+        # 构建综合代价矩阵（与 update() 同一逻辑）
         cost_matrix = np.zeros((self.num_balls, num_detections))
-        
+
+        # 代价权重（来自配置）
+        w_position = self.w_position
+        w_speed = self.w_speed
+        w_direction = self.w_direction
+
         for tracker_id in range(self.num_balls):
             if self.kf_filters[tracker_id].initialized:
                 state = self.kf_filters[tracker_id].get_state()
                 predicted_pos = state['position']
-                
+                predicted_vel = state['velocity']
+                predicted_speed = np.linalg.norm(predicted_vel)
+
                 for det_idx in range(num_detections):
+                    # 1) 位置代价
                     position_cost = np.linalg.norm(predicted_pos - detections[det_idx])
-                    cost_matrix[tracker_id, det_idx] = position_cost
+
+                    # 2) 速度大小与方向代价
+                    speed_cost = 0.0
+                    direction_cost = 0.0
+
+                    if detection_velocities[det_idx] is not None:
+                        detected_vel = detection_velocities[det_idx]
+                        detected_speed = np.linalg.norm(detected_vel)
+
+                        speed_cost = abs(predicted_speed - detected_speed)
+
+                        if predicted_speed > 1e-3 and detected_speed > 1e-3:
+                            predicted_dir = predicted_vel / predicted_speed
+                            detected_dir = detected_vel / detected_speed
+                            cos_similarity = np.dot(predicted_dir, detected_dir)
+                            direction_cost = 1.0 - cos_similarity
+                        else:
+                            direction_cost = 0.0
+
+                    total_cost = (
+                        w_position * position_cost
+                        + w_speed * speed_cost
+                        + w_direction * direction_cost
+                    )
+                    cost_matrix[tracker_id, det_idx] = total_cost
             else:
                 for det_idx in range(num_detections):
                     cost_matrix[tracker_id, det_idx] = self.max_distance
@@ -892,97 +2194,10 @@ class BallTracker:
             # 没有检测到球，保持追踪状态（继续预测）
             print("[更新] 未检测到球，保持当前追踪状态")
             return {}
-        
-        # 估计检测点之间的速度（改进版：使用卡尔曼滤波器的速度预测）
-        detection_velocities = []
-        for det_idx in range(num_detections):
-            # 方法改进：使用最近的激活追踪器的预测速度作为初始估计
-            # 而不是通过历史位置差分计算（容易出错）
-            best_velocity = None
-            min_dist = float('inf')
-            
-            for tracker_id in range(self.num_balls):
-                if self.kf_filters[tracker_id].initialized:
-                    state = self.kf_filters[tracker_id].get_state()
-                    predicted_pos = state['position']
-                    predicted_vel = state['velocity']
-                    
-                    dist = np.linalg.norm(detections[det_idx] - predicted_pos)
-                    if dist < min_dist and dist < self.max_distance:
-                        min_dist = dist
-                        # 使用预测速度，而不是差分速度
-                        best_velocity = predicted_vel
-            
-            detection_velocities.append(best_velocity)
-        
-        # 构建综合代价矩阵
-        cost_matrix = np.zeros((self.num_balls, num_detections))
-        
-        # 权重参数
-        # 关键思路：先用位置做粗匹配，然后用速度等作为修正项
-        # 代价权重配置
-        w_position = 1.0    # 位置代价权重
-        w_speed = 0.000       # 速度大小代价权重
-        w_direction = 0.05   # 速度方向代价权重
 
-        for tracker_id in range(self.num_balls):
-            if self.kf_filters[tracker_id].initialized:
-                # 获取预测状态
-                state = self.kf_filters[tracker_id].get_state()
-                predicted_pos = state['position']
-                predicted_vel = state['velocity']
-                predicted_speed = np.linalg.norm(predicted_vel)
-                
-                for det_idx in range(num_detections):
-                    # 1. 位置距离代价（主导项）
-                    position_cost = np.linalg.norm(predicted_pos - detections[det_idx])
-                    
-                    # 2. 速度代价（分解为速度大小和方向）
-                    speed_cost = 0.0
-                    direction_cost = 0.0
-                    
-                    if detection_velocities[det_idx] is not None:
-                        detected_vel = detection_velocities[det_idx]
-                        detected_speed = np.linalg.norm(detected_vel)
-                        
-                        # 2a. 速度大小代价（绝对差值）
-                        speed_cost = abs(predicted_speed - detected_speed)
-                        
-                        # 2b. 速度方向代价（使用余弦距离）
-                        # 避免除零：当速度很小时方向不可靠
-                        if predicted_speed > 1e-3 and detected_speed > 1e-3:
-                            # 归一化速度向量
-                            predicted_dir = predicted_vel / predicted_speed
-                            detected_dir = detected_vel / detected_speed
-                            # 余弦相似度：[-1, 1]，1表示方向相同，-1表示方向相反
-                            cos_similarity = np.dot(predicted_dir, detected_dir)
-                            # 转换为代价：0表示方向相同，2表示方向相反
-                            direction_cost = 1.0 - cos_similarity
-                        else:
-                            # 速度太小时，方向代价设为0（不惩罚）
-                            direction_cost = 0.0
-                    
-                    # 综合代价（加权求和）
-                    total_cost = (w_position * position_cost + 
-                                  w_speed * speed_cost +
-                                  w_direction * direction_cost
-                                 )
-                    
-                    cost_matrix[tracker_id, det_idx] = total_cost
-                    
-            else:
-                # 未初始化的追踪器：使用中等代价，允许初始化
-                for det_idx in range(num_detections):
-                    cost_matrix[tracker_id, det_idx] = self.max_distance
-        
-        # 使用匈牙利算法求解最优分配
-        row_indices, col_indices = linear_sum_assignment(cost_matrix) #row_indices: 追踪器ID, col_indices: 检测ID
-        
-        # 记录哪些追踪器被成功匹配
-        matched_trackers = set()
-        for tracker_id, det_idx in zip(row_indices, col_indices):
-            if cost_matrix[tracker_id, det_idx] <= self.max_distance:
-                matched_trackers.add(tracker_id)
+        # 复用统一匹配逻辑，避免与 _match_detections 重复实现/漂移
+        assignments = self._match_detections(detections)
+        matched_trackers = set(assignments.keys())
         
         # 处理未匹配的追踪器：重置首次观测验证状态
         for tracker_id in range(self.num_balls):
@@ -994,43 +2209,32 @@ class BallTracker:
                     self.kf_filters[tracker_id].reset()
         
         # 处理分配结果
-        assignments = {}
-        unassigned_detections = set(range(num_detections))
         update_count = 0
-        
-        for tracker_id, det_idx in zip(row_indices, col_indices):
+
+        for tracker_id, det_idx in assignments.items():
             # 已经落地的球不再更新
             if self.ball_grounded[tracker_id]:
                 continue
-                
-            # 检查距离是否在阈值内
-            if cost_matrix[tracker_id, det_idx] <= self.max_distance:
-                # 分配成功
-                assignments[tracker_id] = det_idx
-                unassigned_detections.discard(det_idx)
-                
-                # 区分首次观测和后续观测
-                if not self.ever_validated[tracker_id]:
-                    # 首次观测：需要连续N帧验证
-                    self.consecutive_detections[tracker_id] += 1
-                    
-                    if self.consecutive_detections[tracker_id] >= self.required_detections:
-                        # 达到验证阈值，真正初始化卡尔曼滤波器
-                        print(f"[验证成功] 追踪器{tracker_id}连续检测{self.consecutive_detections[tracker_id]}帧，开始初始化卡尔曼滤波器")
-                        self.kf_filters[tracker_id].update(detections[det_idx])
-                        self.ever_validated[tracker_id] = True
-                        update_count += 1
-                    else:
-                        # 未达到阈值，仅累加计数，不更新滤波器
-                        # print(f"[验证中] 追踪器{tracker_id}连续检测{self.consecutive_detections[tracker_id]}/{self.required_detections}帧")
-                        pass
-                else:
-                    # 已验证过，正常更新卡尔曼滤波器
-                    self.kf_filters[tracker_id].update(detections[det_idx])
-                    update_count += 1
 
+            # 区分首次观测和后续观测
+            if not self.ever_validated[tracker_id]:
+                # 首次观测：需要连续N帧验证
+                self.consecutive_detections[tracker_id] += 1
+
+                if self.consecutive_detections[tracker_id] >= self.required_detections:
+                    # 达到验证阈值，真正初始化卡尔曼滤波器
+                    print(f"[验证成功] 追踪器{tracker_id}连续检测{self.consecutive_detections[tracker_id]}帧，开始初始化卡尔曼滤波器")
+                    self.kf_filters[tracker_id].update(detections[det_idx])
+                    self.ever_validated[tracker_id] = True
+                    update_count += 1
+                else:
+                    # 未达到阈值，仅累加计数，不更新滤波器
+                    # print(f"[验证中] 追踪器{tracker_id}连续检测{self.consecutive_detections[tracker_id]}/{self.required_detections}帧")
+                    pass
             else:
-                pass
+                # 已验证过，正常更新卡尔曼滤波器
+                self.kf_filters[tracker_id].update(detections[det_idx])
+                update_count += 1
         
         if self.verbose:
             elapsed_time = (time.perf_counter() - start_time) * 1000
@@ -1177,7 +2381,6 @@ class BallTracker:
             kf_obs_body: 卡尔曼滤波观测字典（体坐标系）
             max_velocity_uncertainty: 最大速度不确定性阈值
         """
-        import numpy as np
         
         for tracker_id in range(self.num_balls):
             if self.is_validated(tracker_id) and not self.is_grounded(tracker_id):
@@ -1191,7 +2394,13 @@ class BallTracker:
                     
                     kf_obs[tracker_id] = {
                         'position': state['position'].copy(),
-                        'velocity': velocity_to_store
+                        'velocity': velocity_to_store,
+                        'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
+                        'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                        'innovation_r': None,
+                        'innovation_S_diag': None,
+                        'normalized_innovation': None,
+                        'innovation_mahalanobis2': None,
                     }
                     
                     # 转换到体坐标系
@@ -1199,7 +2408,13 @@ class BallTracker:
                     velocity_body = np.dot(base_site_rot.T, state['velocity'])
                     kf_obs_body[tracker_id] = {
                         'position': position_body.copy(),
-                        'velocity': velocity_body.copy()
+                        'velocity': velocity_body.copy(),
+                        'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
+                        'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                        'innovation_r': None,
+                        'innovation_S_diag': None,
+                        'normalized_innovation': None,
+                        'innovation_mahalanobis2': None,
                     }
     
     def cleanup_grounded_balls(self, kf_obs, kf_obs_body):
@@ -1439,8 +2654,14 @@ class BallTracker:
             detection_results: 检测结果列表 [(pos_world, det_info, ray_info), ...]
             actually_updated: dict，记录每个追踪器是否真正执行了update操作
             assignments: dict，Tracker与检测索引的匹配关系 {tracker_id: det_idx}
+            kf_obs_out: 更新后的卡尔曼滤波观测字典（世界坐标系）
+            kf_obs_body_out: 更新后的卡尔曼滤波观测字典（体坐标系）
         """
-        import numpy as np
+
+
+        # 避免直接原地修改调用方对象：本函数内部使用可写副本，最后显式返回
+        kf_obs_out = list(kf_obs) if kf_obs is not None else [None] * self.num_balls
+        kf_obs_body_out = list(kf_obs_body) if kf_obs_body is not None else [None] * self.num_balls
         
         # 检测并定位所有球
         detection_results = self.detect_and_localize_balls(
@@ -1517,27 +2738,51 @@ class BallTracker:
                         # 替换最后一个预测位置为当前状态
                         if (len(self.kf_trajectories[tracker_id]) > 0 and 
                             len(self.kf_velocity[tracker_id]) > 0 and 
-                            len(kf_obs) > 0):
+                            len(kf_obs_out) > 0):
                             self.kf_trajectories[tracker_id][-1] = state['position'].copy()
                             self.kf_velocity[tracker_id][-1] = state['velocity'].copy()
-                            kf_obs[tracker_id] = {
+                            kf_obs_out[tracker_id] = {
                                 'position': state['position'].copy(),
-                                'velocity': velocity_to_store
+                                'velocity': velocity_to_store,
+                                'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
+                                'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                                'innovation_r': None if state.get('innovation_r') is None else state['innovation_r'].copy(),
+                                'innovation_S_diag': None if state.get('innovation_S_diag') is None else state['innovation_S_diag'].copy(),
+                                'normalized_innovation': None if state.get('normalized_innovation') is None else state['normalized_innovation'].copy(),
+                                'innovation_mahalanobis2': state.get('innovation_mahalanobis2', None),
                             }
-                            kf_obs_body[tracker_id] = {
+                            kf_obs_body_out[tracker_id] = {
                                 'position': position_body.copy(),
-                                'velocity': velocity_body.copy()
+                                'velocity': velocity_body.copy(),
+                                'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
+                                'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                                'innovation_r': None if state.get('innovation_r') is None else state['innovation_r'].copy(),
+                                'innovation_S_diag': None if state.get('innovation_S_diag') is None else state['innovation_S_diag'].copy(),
+                                'normalized_innovation': None if state.get('normalized_innovation') is None else state['normalized_innovation'].copy(),
+                                'innovation_mahalanobis2': state.get('innovation_mahalanobis2', None),
                             }
                         else:
                             # 首次记录
                             self.record_kf_trajectory(tracker_id, state['position'], state['velocity'])
-                            kf_obs[tracker_id] = {
+                            kf_obs_out[tracker_id] = {
                                 'position': state['position'].copy(),
-                                'velocity': velocity_to_store
+                                'velocity': velocity_to_store,
+                                'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
+                                'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                                'innovation_r': None if state.get('innovation_r') is None else state['innovation_r'].copy(),
+                                'innovation_S_diag': None if state.get('innovation_S_diag') is None else state['innovation_S_diag'].copy(),
+                                'normalized_innovation': None if state.get('normalized_innovation') is None else state['normalized_innovation'].copy(),
+                                'innovation_mahalanobis2': state.get('innovation_mahalanobis2', None),
                             }
-                            kf_obs_body[tracker_id] = {
+                            kf_obs_body_out[tracker_id] = {
                                 'position': position_body.copy(),
-                                'velocity': velocity_body.copy()
+                                'velocity': velocity_body.copy(),
+                                'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
+                                'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                                'innovation_r': None if state.get('innovation_r') is None else state['innovation_r'].copy(),
+                                'innovation_S_diag': None if state.get('innovation_S_diag') is None else state['innovation_S_diag'].copy(),
+                                'normalized_innovation': None if state.get('normalized_innovation') is None else state['normalized_innovation'].copy(),
+                                'innovation_mahalanobis2': state.get('innovation_mahalanobis2', None),
                             }
             
             # 处理未匹配的追踪器（重置首次观测验证状态）
@@ -1549,7 +2794,7 @@ class BallTracker:
                         self.consecutive_detections[tracker_id] = 0
                         self.kf_filters[tracker_id].reset()
         
-        return has_detection, detection_results, actually_updated, assignments
+        return has_detection, detection_results, actually_updated, assignments, kf_obs_out, kf_obs_body_out
     
     @staticmethod
     def catch_info_from_kf_obs_body(kf_obs_body):
@@ -1599,9 +2844,6 @@ class BallTrackingVisualizer:
     球追踪可视化器 - 使用 matplotlib 3D 图表显示追踪结果
     不再内部存储轨迹数据，而是从BallTracker接收轨迹数据进行可视化
     """
-    
-
-    
     def __init__(self, num_balls=3):
         """
         初始化可视化器

@@ -16,7 +16,7 @@ import time
 import yaml
 from pathlib import Path
 from robot_bridge_py.robot_client import RobotClient
-from perception import CameraIntrinsics, BallTracker, BallTrackingVisualizer, IGNORE_BOTTOM_ROWS
+from perception import CameraIntrinsics, BallTracker, BallTrackingVisualizer
 import message_filters
 
 
@@ -31,6 +31,75 @@ class BallTrackingNode(Node):
     def __init__(self):
         super().__init__('ball_tracking_node')
         self.bridge = CvBridge()
+        
+        # === 相机参数配置 ===
+        config_path = Path(__file__).parent / 'Tracker_config.yaml'
+        if not config_path.exists():
+            raise FileNotFoundError(f"相机配置文件不存在: {config_path}")
+
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        self.get_logger().info(f"Loaded camera config from: {config_path}")
+
+        camera_section = config.get('camera', {})
+        camera_profiles = camera_section.get('profiles', {})
+        camera_profile_name = str(camera_section.get('profile', 'left_rect'))
+        profile_cfg = camera_profiles.get(camera_profile_name, {})
+
+        self.camera_topic = profile_cfg.get('image_topic', '/zed/zed_node/left/image_rect_color')
+        self.depth_topic = profile_cfg.get('depth_topic', '/zed/zed_node/depth/depth_registered')
+
+        undistort_cfg = profile_cfg.get('undistort', {})
+        self.use_raw_undistort = bool(undistort_cfg.get('enabled', False))
+        self.map1 = None
+        self.map2 = None
+
+        if self.use_raw_undistort:
+            self.img_width = int(undistort_cfg.get('width', 640))
+            self.img_height = int(undistort_cfg.get('height', 360))
+
+            K_cfg = undistort_cfg.get('K', None)
+            D_cfg = undistort_cfg.get('D', None)
+            if K_cfg is None or D_cfg is None:
+                raise ValueError(
+                    f"camera.profiles.{camera_profile_name}.undistort 缺少 K 或 D 配置"
+                )
+
+            self.K = np.asarray(K_cfg, dtype=np.float64).reshape(3, 3)
+            self.D = np.asarray(D_cfg, dtype=np.float64).reshape(-1)
+
+            # rectification rotation
+            R = np.eye(3, dtype=np.float64)
+            balance = float(undistort_cfg.get('balance', 0.0))
+
+            # 去畸变后的新内参
+            self.K_new = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                self.K,
+                self.D,
+                (self.img_width, self.img_height),
+                R,
+                balance=balance
+            )
+
+            # 预计算 undistort map
+            self.map1, self.map2 = cv2.fisheye.initUndistortRectifyMap(
+                self.K,
+                self.D,
+                R,
+                self.K_new,
+                (self.img_width, self.img_height),
+                cv2.CV_16SC2
+            )
+
+        self.get_logger().info(
+            f"Camera profile={camera_profile_name}, image_topic={self.camera_topic}, depth_topic={self.depth_topic}, "
+            f"undistort={'on' if self.use_raw_undistort else 'off'}"
+        )
+        
+        
+        
+        
+        
         
         # === RobotClient（用于获取 IMU 数据）===
         self.robot = RobotClient(
@@ -59,17 +128,8 @@ class BallTrackingNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         
         # === 相机参数 ===
-        # 从配置文件加载相机参数
-        config_path = Path(__file__).parent / 'Tracker_config.yaml'
-        if not config_path.exists():
-            raise FileNotFoundError(f"相机配置文件不存在: {config_path}")
-        
-        with open(config_path, 'r') as f:
-            camera_config = yaml.safe_load(f)
-        self.get_logger().info(f"Loaded camera config from: {config_path}")
-        
-        # 加载相机内参
-        intr = camera_config['intrinsics']
+        # 优先使用 profile 内的 intrinsics；否则回退到全局 intrinsics
+        intr = profile_cfg.get('intrinsics', config['intrinsics'])
         self.camera_width = intr['width']
         self.camera_height = intr['height']
         self.camera_intrinsics = CameraIntrinsics(
@@ -80,26 +140,47 @@ class BallTrackingNode(Node):
             cx=intr['cx'],
             cy=intr['cy']
         )
+
+        # 如果使用 raw 图像并进行了 fisheye 去畸变，
+        # 则追踪所用内参必须与 remap 后图像一致（即 K_new）。
+        if self.use_raw_undistort:
+            fx_new = float(self.K_new[0, 0])
+            fy_new = float(self.K_new[1, 1])
+            cx_new = float(self.K_new[0, 2])
+            cy_new = float(self.K_new[1, 2])
+
+            self.camera_width = int(self.img_width)
+            self.camera_height = int(self.img_height)
+            self.camera_intrinsics = CameraIntrinsics(
+                width=self.camera_width,
+                height=self.camera_height,
+                fx=fx_new,
+                fy=fy_new,
+                cx=cx_new,
+                cy=cy_new,
+            )
+            self.get_logger().info(
+                "Using image_raw with undistort intrinsics: "
+                f"fx={fx_new:.3f}, fy={fy_new:.3f}, cx={cx_new:.3f}, cy={cy_new:.3f}"
+            )
         
         # === 球追踪器 ===
         # 从配置文件加载tracker参数
-        tracker_config = camera_config['tracker']
-        self.num_balls = tracker_config['num_balls']
-        self.dt = tracker_config['dt']
-        self.ball_tracker = BallTracker(
-            num_balls=self.num_balls,
-            dt=self.dt,
-            g=tracker_config['g'],
-            process_noise = tracker_config.get('process_noise', 0.001),
-            measurement_noise = tracker_config.get('measurement_noise', 0.001),
-            max_distance=tracker_config['max_distance'],
-            drag_coefficient=tracker_config['drag_coefficient'],
-            verbose=tracker_config['verbose']
-        )
-        self.center_method = tracker_config.get('center_method', 'min_depth')
-        self.ball_radius = tracker_config.get('ball_radius', 0.0375)
+        tracker_config = config['tracker']
+        runtime_cfg = tracker_config.get('runtime', {})
+        detector_cfg = tracker_config.get('detector', {})
+        trajectory_cfg = tracker_config.get('trajectory', {})
+
+        self.num_balls = int(runtime_cfg.get('num_balls', tracker_config.get('num_balls', 1)))
+        self.dt = float(runtime_cfg.get('dt', tracker_config.get('dt', 1.0 / 60.0)))
+        self.ball_tracker = BallTracker(tracker_config=tracker_config)
+        self.center_border_pixels = int(detector_cfg.get('center_border_pixels', tracker_config.get('center_border_pixels', 50)))
+        self.center_method = detector_cfg.get('center_method', tracker_config.get('center_method', 'min_depth'))
+        self.ball_radius = float(detector_cfg.get('ball_radius', tracker_config.get('ball_radius', 0.0375)))
         # 轨迹保存坐标系：'body' 或 'world'
-        self.trajectory_coord_frame = str(tracker_config.get('trajectory_coord_frame', 'body')).lower()
+        self.trajectory_coord_frame = str(
+            trajectory_cfg.get('coord_frame', tracker_config.get('trajectory_coord_frame', 'body'))
+        ).lower()
         if self.trajectory_coord_frame not in ('body', 'world'):
             self.get_logger().warn(
                 f"Invalid tracker.trajectory_coord_frame={self.trajectory_coord_frame}, fallback to 'body'"
@@ -107,15 +188,19 @@ class BallTrackingNode(Node):
             self.trajectory_coord_frame = 'body'
         
         # === 地面高度阈值 ===
-        self.ground_z_threshold = tracker_config['ground_z_threshold']
+        self.ground_z_threshold = float(
+            runtime_cfg.get('ground_z_threshold', tracker_config.get('ground_z_threshold', -0.2))
+        )
         
         # === 卡尔曼滤波观测 ===
         self.kf_obs = [None] * self.num_balls
         self.kf_obs_body = [None] * self.num_balls
-        self.max_velocity_uncertainty = tracker_config['max_velocity_uncertainty']
+        self.max_velocity_uncertainty = float(
+            runtime_cfg.get('max_velocity_uncertainty', tracker_config.get('max_velocity_uncertainty', 0.5))
+        )
         
         # === 测试模式配置 ===
-        test_mode_config = camera_config.get('test_mode', {})
+        test_mode_config = config.get('test_mode', {})
         self.test_mode_enabled = test_mode_config.get('enable', False)
         self.max_upgrades_after_valid = test_mode_config.get('max_upgrades_after_valid', 10)
         self.upgrade_counter = [0] * self.num_balls  # 记录每个tracker的upgrade次数
@@ -161,13 +246,13 @@ class BallTrackingNode(Node):
         rgb_sub = message_filters.Subscriber(
             self,
             Image,
-            '/zed/zed_node/left/image_rect_color'
+            self.camera_topic
         )
         
         depth_sub = message_filters.Subscriber(
             self,
             Image,
-            '/zed/zed_node/depth/depth_registered'
+            self.depth_topic
         )
         
         # 使用近似时间同步器（允许5ms的时间差）
@@ -230,7 +315,17 @@ class BallTrackingNode(Node):
         # 处理深度图像
         cv_depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         
-        # 使用深度信息创建mask，只保留0.7米以内的区域
+        if self.use_raw_undistort and self.map1 is not None and self.map2 is not None:
+            #去畸变
+            cv_image = cv2.remap(
+            cv_image,
+            self.map1,
+            self.map2,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT)
+            
+        
+        # 使用深度信息创建mask，只保留1米以内的区域
         cv_image_masked = cv_image.copy()
         
         # 创建深度mask：深度在0到1.0米之间的像素
@@ -328,7 +423,6 @@ class BallTrackingNode(Node):
             base_rot: 3x3 旋转矩阵（机器人本体姿态）
         """
         quat, _ = self.get_robot_imu_data()
-        
         # 检查四元数是否有效
         if quat is None or (quat[0] == 0 and quat[1] == 0 and quat[2] == 0 and quat[3] == 0):
             return np.eye(3)
@@ -409,7 +503,7 @@ class BallTrackingNode(Node):
         
         if image_changed:
             # 图像发生变化，进行检测和更新
-            has_detection, detection_results, actually_updated, detection_assignments = \
+            has_detection, detection_results, actually_updated, detection_assignments, kf_obs_out, kf_obs_body_out = \
                 self.ball_tracker.process_detection_and_update(
                     rgb_bgr, depth_array,
                     self.camera_intrinsics, cam_pos, cam_rot,
@@ -424,6 +518,8 @@ class BallTrackingNode(Node):
                     center_method=self.center_method,
                     ball_radius=self.ball_radius
                 )
+            self.kf_obs = kf_obs_out
+            self.kf_obs_body = kf_obs_body_out
             
             # 在test模式下，根据actually_updated更新upgrade_counter
             if self.test_mode_enabled:
@@ -553,11 +649,15 @@ class BallTrackingNode(Node):
                 
                 # 获取detection位置（如果有）
                 detection_pos = None
+                contour_area = None
                 if has_detection.get(tracker_id, False):
                     # 使用Tracker内部匹配结果，避免重复做最近邻匹配
                     det_idx = detection_assignments.get(tracker_id, None)
                     if det_idx is not None and 0 <= det_idx < len(detection_results):
                         det_pos_world = detection_results[det_idx][0]
+                        det_info = detection_results[det_idx][1]
+                        if det_info is not None and det_info.get('area', None) is not None:
+                            contour_area = float(det_info['area'])
                         if self.trajectory_coord_frame == 'world':
                             detection_pos = det_pos_world.tolist()
                         else:
@@ -580,6 +680,28 @@ class BallTrackingNode(Node):
                     # cv2.imwrite(rgb_filename, rgb_image)
                     # 保存带检测可视化标注的RGB图（center + contour）
                     rgb_to_save = rgb_image.copy()
+
+                    # 在带标注图上也绘制 center 有效边框（仅用于center合法性判断）
+                    h_ov, w_ov = rgb_to_save.shape[:2]
+                    border_ov = int(max(0, min(self.center_border_pixels, h_ov // 2, w_ov // 2)))
+                    if border_ov > 0:
+                        cv2.rectangle(
+                            rgb_to_save,
+                            (border_ov, border_ov),
+                            (w_ov - border_ov - 1, h_ov - border_ov - 1),
+                            (0, 255, 255),
+                            2,
+                        )
+                        cv2.putText(
+                            rgb_to_save,
+                            f"center valid region (border={border_ov}px)",
+                            (10, 22),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 255, 255),
+                            1,
+                        )
+
                     if detection_results:
                         for det_idx, (_, det_info, _) in enumerate(detection_results):
                             if det_info is None:
@@ -642,6 +764,21 @@ class BallTrackingNode(Node):
                                 1,
                             )
 
+                    # 叠加不确定性归一化创新（vx, vy, vz）
+                    nu_xyz = kf_data.get('normalized_innovation', None)
+                    if nu_xyz is not None:
+                        nu_xyz = np.asarray(nu_xyz, dtype=float).reshape(3)
+                        nu_text_y = 24 + 22 * int(tracker_id) + 18
+                        cv2.putText(
+                            rgb_to_save,
+                            f"nu[{tracker_id}]=[{nu_xyz[0]:.2f}, {nu_xyz[1]:.2f}, {nu_xyz[2]:.2f}]",
+                            (10, nu_text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 200, 255),
+                            1,
+                        )
+
                     # 保留原始图（沿用现有命名）
                     cv2.imwrite(rgb_filename, rgb_image)
                     # 另存一张带标注图
@@ -659,8 +796,15 @@ class BallTrackingNode(Node):
                         'body_pos': base_pos.tolist(),
                         'body_rot': base_rot.tolist(),
                         'detection_pos': detection_pos,
+                        'contour_area': contour_area,
                         'kf_pos': kf_data['position'].tolist() if kf_data['position'] is not None else None,
                         'kf_vel': kf_data['velocity'].tolist() if kf_data['velocity'] is not None else None,
+                        'kf_pos_var': kf_data['kf_pos_var'].tolist() if kf_data.get('kf_pos_var') is not None else None,
+                        'kf_vel_var': kf_data['kf_vel_var'].tolist() if kf_data.get('kf_vel_var') is not None else None,
+                        'innovation_r': kf_data['innovation_r'].tolist() if kf_data.get('innovation_r') is not None else None,
+                        'innovation_S_diag': kf_data['innovation_S_diag'].tolist() if kf_data.get('innovation_S_diag') is not None else None,
+                        'normalized_innovation': kf_data['normalized_innovation'].tolist() if kf_data.get('normalized_innovation') is not None else None,
+                        'innovation_mahalanobis2': float(kf_data['innovation_mahalanobis2']) if kf_data.get('innovation_mahalanobis2') is not None else None,
                         'has_detection': has_detection.get(tracker_id, False),
                         'kf_state': kf_state,  # 'update' 或 'predict'
                         'rgb_file': f"rgb_{frame_idx:06d}.png",
@@ -734,6 +878,14 @@ class BallTrackingNode(Node):
             del self.trajectory_data[tracker_id]
         if tracker_id in self.trajectory_start_time:
             del self.trajectory_start_time[tracker_id]
+
+    def save_all_active_trajectories(self):
+        """退出前强制保存所有仍在记录中的轨迹（即使还没落地）。"""
+        if not self.enable_trajectory_recording:
+            return
+        active_ids = [tid for tid, frames in self.trajectory_data.items() if len(frames) > 0]
+        for tid in active_ids:
+            self.save_trajectory(tid)
     
     def generate_visualization_images(self, rgb_bgr, depth_array, detection_results):
         """
@@ -747,12 +899,13 @@ class BallTrackingNode(Node):
         # === RGB 可视化 ===
         rgb_vis = rgb_bgr.copy()
 
-        # 绘制底部检测屏蔽区分界线
-        if IGNORE_BOTTOM_ROWS > 0 and rgb_vis.shape[0] > IGNORE_BOTTOM_ROWS:
-            boundary_y = rgb_vis.shape[0] - IGNORE_BOTTOM_ROWS
-            cv2.line(rgb_vis, (0, boundary_y), (rgb_vis.shape[1] - 1, boundary_y), (0, 255, 255), 2)
-            cv2.putText(rgb_vis, f"ignore bottom {IGNORE_BOTTOM_ROWS}px",
-                        (10, max(20, boundary_y - 8)),
+        # 绘制 center 无效边框（仅用于center合法性判断，不屏蔽检测）
+        h_rgb, w_rgb = rgb_vis.shape[:2]
+        border = int(max(0, min(self.center_border_pixels, h_rgb // 2, w_rgb // 2)))
+        if border > 0:
+            cv2.rectangle(rgb_vis, (border, border), (w_rgb - border - 1, h_rgb - border - 1), (0, 255, 255), 2)
+            cv2.putText(rgb_vis, f"center valid region (border={border}px)",
+                        (10, 22),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
         
         # 绘制检测结果
@@ -831,10 +984,11 @@ class BallTrackingNode(Node):
         
         depth_vis = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
 
-        # 在深度可视化上也画出同一分界线，便于对齐观察
-        if IGNORE_BOTTOM_ROWS > 0 and depth_vis.shape[0] > IGNORE_BOTTOM_ROWS:
-            boundary_y = depth_vis.shape[0] - IGNORE_BOTTOM_ROWS
-            cv2.line(depth_vis, (0, boundary_y), (depth_vis.shape[1] - 1, boundary_y), (0, 255, 255), 2)
+        # 在深度可视化上也画出同一 center 有效区域边框，便于对齐观察
+        h_dep, w_dep = depth_vis.shape[:2]
+        border_dep = int(max(0, min(self.center_border_pixels, h_dep // 2, w_dep // 2)))
+        if border_dep > 0:
+            cv2.rectangle(depth_vis, (border_dep, border_dep), (w_dep - border_dep - 1, h_dep - border_dep - 1), (0, 255, 255), 2)
         
         # 在深度图上绘制检测点
         # detection_results 是 [(pos_body, det_info, ray_info), ...] 格式（body坐标系）
@@ -1162,8 +1316,10 @@ class BallTrackingNode(Node):
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             self.get_logger().info("退出程序...")
+            self.save_all_active_trajectories()
             cv2.destroyAllWindows()
-            rclpy.shutdown()
+            if rclpy.ok():
+                rclpy.shutdown()
 
 
 
@@ -1178,8 +1334,11 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # Ctrl+C 或异常退出时，确保把未落地但已记录的轨迹也落盘
+        node.save_all_active_trajectories()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 

@@ -1,7 +1,44 @@
 # ZED相机配置文件
 # 用于可视化脚本的相机内参和外参
 
-# zedmini相机内参
+# 相机输入源选择与参数
+camera:
+  # 可选: left_raw / left_rect
+  profile: left_rect
+
+  profiles:
+    left_raw:
+      image_topic: /zed/zed_node/left_raw/image_raw_color
+      depth_topic: /zed/zed_node/depth/depth_registered
+
+      # raw 图像先做 fisheye 去畸变，再用于追踪
+      undistort:
+        enabled: true
+        width: 640
+        height: 360
+        # 来自 /zed/zed_node/left_raw/image_raw_color/camera_info
+        K:
+          - [386.7950134277344, 0.0, 321.3525085449219]
+          - [0.0, 386.7049865722656, 179.2572479248047]
+          - [0.0, 0.0, 1.0]
+        D: [-0.029896799474954605, 0.009694409556686878, 0.007039539981633425, -0.004982220008969307]
+        # balance=0 更像裁剪后更直，balance=1 保留更多视场
+        balance: 0.0
+
+    left_rect:
+      image_topic: /zed/zed_node/left/image_rect_color
+      depth_topic: /zed/zed_node/depth/depth_registered
+      undistort:
+        enabled: false
+      intrinsics:
+        width: 640
+        height: 360
+        fx: 366.9034423828125
+        fy: 366.9034423828125
+        cx: 316.4409484863281
+        cy: 177.47792053222656
+
+# zed mini相机内参
 intrinsics:
   width: 640
   height: 360
@@ -10,7 +47,7 @@ intrinsics:
   cx: 316.4409484863281
   cy: 177.47792053222656
 
-# # zed2相机内参
+# # zed 2相机内参
 # intrinsics:
 #   width: 640
 #   height: 360
@@ -67,48 +104,75 @@ extrinsics:
 
 # 球追踪器参数
 tracker:
-  # 追踪球的数量
-  num_balls: 1
-  
-  # 追踪频率 (Hz)
-  dt: 0.016666666666666666  # 1/60.0 = 60Hz
-  
-  # 重力加速度 (m/s²)
-  g: 9.81
-  
-  # 卡尔曼滤波过程噪声（提高值会降低对预测的信任）
-  process_noise: [0.01, 0.01, 0.05] 
-  
-  # 卡尔曼滤波观测噪声（降低值会提高对观测的信任）
-  measurement_noise: [0.0001,0.0001,0.0002]
+  # 运行时主控参数
+  runtime:
+    # 追踪球的数量
+    num_balls: 1
+    # 追踪频率 (Hz)
+    dt: 0.016666666666666666  # 1/60.0 = 60Hz
+    # 是否输出详细日志
+    verbose: false
+    # 首次观测需要连续检测到的帧数
+    required_detections: 2
+    # 地面高度阈值 (m)，低于此高度认为球已落地
+    ground_z_threshold: -0.22
+    # 速度不确定性最大值 (m/s)
+    max_velocity_uncertainty: 0.5
 
-  # 离线回放：每一帧从当前主KF状态向前predict N步
-  predict_n: 5
-  
-  # 数据关联最大距离阈值 (m)
-  max_distance: 1.0
-  
-  # 空气阻力系数（典型值0.1-1.0）
-  drag_coefficient: 0.0
-  
-  # 是否输出详细日志
-  verbose: false
-  
-  # 地面高度阈值 (m)，低于此高度认为球已落地
-  ground_z_threshold: -0.22
-  
-  # 速度不确定性最大值 (m/s)
-  max_velocity_uncertainty: 0.5
+  # 数据关联参数（BallTracker._match_detections）
+  association:
+    # 数据关联最大距离阈值 (m)
+    max_distance: 1.0
+    # 数据关联代价权重（位置 + 速度大小 + 速度方向）
+    w_position: 1.0
+    w_speed: 0.000
+    w_direction: 0.05
 
-  # 中心点计算方法
-  center_method: "nearest" # "min_depth"
+  # 检测参数（MultiRedBallDetector + 检测后几何重建）
+  detector:
+    # 中心点计算方法
+    center_method: "nearest" # "min_depth"
+    # RGB图像四周center无效边框像素宽度（仅用于center校验）
+    center_border_pixels: 50
+    # 轮廓检测形状约束（MultiRedBallDetector）
+    min_area: 500
+    max_area: 9000
+    min_circularity: 0.75
+    # 球半径 (m)
+    ball_radius: 0.0375
 
-  # 球半径 (m)
-  ball_radius: 0.0375
+  # KalmanFilter3D 参数
+  kalman:
+    # 重力加速度 (m/s²)
+    g: 9.81
+    # 卡尔曼滤波过程噪声（提高值会降低对预测的信任）
+    process_noise: [0.0002, 0.0001, 0.0002]
+    # 卡尔曼滤波观测噪声（降低值会提高对观测的信任）
+    measurement_noise: [0.030, 0.022, 0.030]
+    # 空气阻力系数（典型值0.1-1.0）
+    drag_coefficient: 0.0
+    # ===== KalmanFilter3D 鲁棒更新参数（soft/hard gating） =====
+    enable_axiswise_outlier_rejection: true
+    axis_soft_gate_threshold: [0.5, 0.5, 0.5]
+    axis_hard_gate_threshold: [5.0, 5.0, 5.0]
+    axis_abs_residual_threshold: null #[0.03, 0.02, 0.05]
+    min_soft_weight: 0.05
+    rejection_cov_inflation: [2, 2, 4]
+    rejection_position_inflate_std: [0.02, 0.02, 0.03]
+    rejection_velocity_inflate_std: [0.20, 0.20, 0.30]
 
-  # 轨迹保存坐标系（影响trajectory_data里detection_pos/kf_pos）
-  # 可选: "body"(imu_link坐标系) / "world"(世界坐标系)
-  trajectory_coord_frame: "body"
+  # 轨迹输出参数
+  trajectory:
+    # 轨迹保存坐标系（影响trajectory_data里detection_pos/kf_pos）
+    # 可选: "body"(imu_link坐标系) / "world"(世界坐标系)
+    coord_frame: "world"
+
+  # 离线重放参数
+  offline:
+    # 离线回放：每一帧从当前主KF状态向前predict N步
+    # enable_predict_n=false 时，离线脚本会忽略 predict_n（等效为0）
+    enable_predict_n: false
+    predict_n: 5
 
   # 是否可视化ICP过程
   visualize_icp: False

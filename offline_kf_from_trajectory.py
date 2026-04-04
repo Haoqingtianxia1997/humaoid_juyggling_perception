@@ -50,38 +50,133 @@ def _as_list_or_none(v):
     return [float(x) for x in v]
 
 
+def _state_field_as_list_or_none(state, key):
+    if state is None:
+        return None
+    v = state.get(key, None)
+    return _as_list_or_none(v)
+
+
+def _state_field_as_float_or_none(state, key):
+    if state is None:
+        return None
+    v = state.get(key, None)
+    if v is None:
+        return None
+    return float(v)
+
+
+def _fit_axis_online_ols(times: np.ndarray, values: np.ndarray, degree: int):
+    """在线前缀 OLS：返回可用于 np.polyval 的系数；样本不足时返回 None。"""
+    t = np.asarray(times, dtype=float).reshape(-1)
+    y = np.asarray(values, dtype=float).reshape(-1)
+    valid = np.isfinite(t) & np.isfinite(y)
+    t = t[valid]
+    y = y[valid]
+    if t.size == 0:
+        return None
+    if degree == 2 and t.size >= 3 and np.ptp(t) > 1e-12:
+        return np.polyfit(t, y, 2)
+    if t.size >= 2 and np.ptp(t) > 1e-12:
+        return np.polyfit(t, y, 1)
+    # 仅一个样本：退化为常量模型
+    return np.asarray([float(y[-1])], dtype=float)
+
+
+def _poly_eval_and_derivative(coef: np.ndarray, t: float) -> tuple[float, float]:
+    c = np.asarray(coef, dtype=float).reshape(-1)
+    pos = float(np.polyval(c, t))
+    if c.size <= 1:
+        vel = 0.0
+    else:
+        vel = float(np.polyval(np.polyder(c), t))
+    return pos, vel
+
+
+def _kinematic_predict_from_state(pos: np.ndarray, vel: np.ndarray, dt: float, g_abs: float):
+    dt = max(0.0, float(dt))
+    p = np.asarray(pos, dtype=float).reshape(3)
+    v = np.asarray(vel, dtype=float).reshape(3)
+    out_p = np.array([
+        p[0] + v[0] * dt,
+        p[1] + v[1] * dt,
+        p[2] + v[2] * dt - 0.5 * g_abs * dt * dt,
+    ], dtype=float)
+    out_v = np.array([
+        v[0],
+        v[1],
+        v[2] - g_abs * dt,
+    ], dtype=float)
+    return out_p, out_v
+
+
 def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_n: int):
     with open(json_path, "r", encoding="utf-8") as f:
         traj = json.load(f)
 
     frames = traj.get("frames", [])
     frames = sorted(frames, key=lambda x: x.get("frame_index", 0))
+    source_coord_frame = _normalize_coord_frame(traj.get("coord_frame", "body"))
 
-    tracker = BallTracker(
-        num_balls=1,
-        dt=tracker_params["dt"],
-        g=tracker_params["g"],
-        process_noise=tracker_params.get("process_noise", 0.001),
-        measurement_noise=tracker_params.get("measurement_noise", 0.001),
-        max_distance=tracker_params.get("max_distance", 0.5),
-        drag_coefficient=tracker_params.get("drag_coefficient", 0.0),
-        verbose=False,
-    )
-    ground_z_threshold = tracker_params.get("ground_z_threshold", -0.2)
+    offline_tracker_cfg = dict(tracker_params)
+    runtime_cfg = dict(offline_tracker_cfg.get("runtime", {}))
+    runtime_cfg["num_balls"] = 1
+    runtime_cfg["verbose"] = False
+    offline_tracker_cfg["runtime"] = runtime_cfg
+
+    # 兼容旧结构
+    offline_tracker_cfg["num_balls"] = 1
+    offline_tracker_cfg["verbose"] = False
+
+    tracker = BallTracker(tracker_config=offline_tracker_cfg)
+    ground_z_threshold = runtime_cfg.get("ground_z_threshold", tracker_params.get("ground_z_threshold", -0.2))
 
     main_pos_hist, main_vel_hist = [], []
+    main_pos_var_hist, main_vel_var_hist = [], []
+    main_innovation_r_hist, main_innovation_S_diag_hist = [], []
+    main_normalized_innovation_hist, main_innovation_mahalanobis2_hist = [], []
     det_pos_hist = []
     did_upgrade_hist = []
+    kf_state_hist = []
 
     future_pos_hist = [None] * len(frames)
     future_vel_hist = [None] * len(frames)
 
+    # detection 在线 OLS 拟合（有 detection 用前缀拟合；无 detection 用最近拟合状态做运动学预测）
+    online_det_fit_pos_hist = [None] * len(frames)
+    online_det_fit_vel_hist = [None] * len(frames)
+    det_fit_times: list[float] = []
+    det_fit_points: list[np.ndarray] = []
+    last_online_fit_pos = None
+    last_online_fit_vel = None
+    last_online_fit_t = None
+
     # 与 zed_tracker_deploy 流程一致，保留清理调用
     kf_obs = [None]
     kf_obs_body = [None]
+    missing_pose_for_body_count = 0
+    kalman_cfg = tracker_params.get("kalman", {})
+    g_abs = float(abs(kalman_cfg.get("g", tracker_params.get("g", 9.81))))
+    dt_default = float(runtime_cfg.get("dt", tracker_params.get("dt", 1.0 / 60.0)))
+    t0_abs = float(frames[0].get("timestamp", 0.0)) if len(frames) > 0 and frames[0].get("timestamp", None) is not None else 0.0
 
     for i, fr in enumerate(frames):
-        det = fr.get("detection_pos", None)
+        ts_abs = fr.get("timestamp", None)
+        t_curr = float(ts_abs) - t0_abs if ts_abs is not None else float(i) * dt_default
+
+        det_raw = fr.get("detection_pos", None)
+        det = None
+        if det_raw is not None:
+            det_arr = np.asarray(det_raw, dtype=float).reshape(3)
+            if source_coord_frame == "world":
+                det = det_arr
+            else:
+                body_pos, body_rot = _parse_body_pose(fr)
+                if body_pos is not None and body_rot is not None:
+                    # 统一到世界坐标系后再喂给离线KF
+                    det = body_rot @ det_arr + body_pos
+                else:
+                    missing_pose_for_body_count += 1
 
         # 1) predict（仅对已验证tracker）
         if tracker.is_validated(0):
@@ -97,14 +192,68 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
         after_update_count = tracker.kf_filters[0].update_count
         did_upgrade = after_update_count > before_update_count
 
+        # detection 在线 OLS 拟合 / 缺失外推
+        if det is not None:
+            det_fit_times.append(float(t_curr))
+            det_fit_points.append(np.asarray(det, dtype=float).reshape(3))
+
+            tp = np.asarray(det_fit_times, dtype=float)
+            pp = np.asarray(det_fit_points, dtype=float)
+
+            coef_x = _fit_axis_online_ols(tp, pp[:, 0], degree=1)
+            coef_y = _fit_axis_online_ols(tp, pp[:, 1], degree=1)
+            coef_z = _fit_axis_online_ols(tp, pp[:, 2], degree=2)
+
+            if coef_x is not None and coef_y is not None and coef_z is not None:
+                px, vx = _poly_eval_and_derivative(coef_x, float(t_curr))
+                py, vy = _poly_eval_and_derivative(coef_y, float(t_curr))
+                pz, vz = _poly_eval_and_derivative(coef_z, float(t_curr))
+                last_online_fit_pos = np.asarray([px, py, pz], dtype=float)
+                last_online_fit_vel = np.asarray([vx, vy, vz], dtype=float)
+                last_online_fit_t = float(t_curr)
+                online_det_fit_pos_hist[i] = last_online_fit_pos.copy()
+                online_det_fit_vel_hist[i] = last_online_fit_vel.copy()
+        else:
+            if (
+                last_online_fit_pos is not None
+                and last_online_fit_vel is not None
+                and last_online_fit_t is not None
+            ):
+                p_pred, v_pred = _kinematic_predict_from_state(
+                    last_online_fit_pos,
+                    last_online_fit_vel,
+                    dt=float(t_curr) - float(last_online_fit_t),
+                    g_abs=g_abs,
+                )
+                last_online_fit_pos = p_pred
+                last_online_fit_vel = v_pred
+                last_online_fit_t = float(t_curr)
+                online_det_fit_pos_hist[i] = p_pred.copy()
+                online_det_fit_vel_hist[i] = v_pred.copy()
+
         main_state = tracker.get_state(0)
         m_pos, m_vel = _state_or_none(main_state)
         main_pos_hist.append(m_pos)
         main_vel_hist.append(m_vel)
+        main_pos_var_hist.append(_state_field_as_list_or_none(main_state, "position_uncertainty"))
+        main_vel_var_hist.append(_state_field_as_list_or_none(main_state, "velocity_uncertainty"))
+        main_innovation_r_hist.append(_state_field_as_list_or_none(main_state, "innovation_r"))
+        main_innovation_S_diag_hist.append(_state_field_as_list_or_none(main_state, "innovation_S_diag"))
+        main_normalized_innovation_hist.append(_state_field_as_list_or_none(main_state, "normalized_innovation"))
+        main_innovation_mahalanobis2_hist.append(
+            _state_field_as_float_or_none(main_state, "innovation_mahalanobis2")
+        )
         did_upgrade_hist.append(bool(did_upgrade))
+        if did_upgrade:
+            kf_state_hist.append("update")
+        elif main_state is not None:
+            kf_state_hist.append("predict")
+        else:
+            kf_state_hist.append("")
 
         # 4) 每一帧都从当前主KF状态向前 predict N 步，作为第二条轨迹
-        if tracker.kf_filters[0].initialized:
+        #    当 predict_n<=0（例如配置 enable_predict_n=false）时，不生成 future 轨迹
+        if int(predict_n) > 0 and tracker.kf_filters[0].initialized:
             future_kf = copy.deepcopy(tracker.kf_filters[0])
             for _ in range(max(0, int(predict_n))):
                 future_kf.predict()
@@ -115,20 +264,26 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
                 future_vel_hist[tgt_idx] = f_vel
 
         det_pos_hist.append(None if det is None else np.asarray(det, dtype=float))
+ 
+    association_cfg = tracker_params.get("association", {})
 
     return {
         "meta": {
             "tracker_id": traj.get("tracker_id"),
             "source_json": str(json_path),
             "num_frames": len(frames),
-            "coord_frame": str(traj.get("coord_frame", "body")).lower(),
+            "coord_frame": "world",
+            "source_coord_frame": source_coord_frame,
+            "kf_runtime_frame": "world",
+            "missing_pose_for_body_count": int(missing_pose_for_body_count),
+            "enable_offline_predict_n": bool(int(predict_n) > 0),
             "predict_n": int(predict_n),
-            "dt": float(tracker_params["dt"]),
-            "g": float(tracker_params["g"]),
-            "process_noise": tracker_params.get("process_noise", 0.001),
-            "measurement_noise": tracker_params.get("measurement_noise", 0.001),
-            "drag_coefficient": float(tracker_params.get("drag_coefficient", 0.0)),
-            "max_distance": float(tracker_params.get("max_distance", 0.5)),
+            "dt": float(runtime_cfg.get("dt", tracker_params.get("dt", 1.0 / 60.0))),
+            "g": float(kalman_cfg.get("g", tracker_params.get("g", 9.81))),
+            "process_noise": kalman_cfg.get("process_noise", tracker_params.get("process_noise", 0.001)),
+            "measurement_noise": kalman_cfg.get("measurement_noise", tracker_params.get("measurement_noise", 0.001)),
+            "drag_coefficient": float(kalman_cfg.get("drag_coefficient", tracker_params.get("drag_coefficient", 0.0))),
+            "max_distance": float(association_cfg.get("max_distance", tracker_params.get("max_distance", 0.5))),
             "ground_z_threshold": float(ground_z_threshold),
         },
         "frames": [
@@ -138,11 +293,27 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
                 "detection_pos": _as_list_or_none(det_pos_hist[i]),
                 "body_pos": fr.get("body_pos", None),
                 "body_rot": fr.get("body_rot", None),
+                "has_detection": bool(det_pos_hist[i] is not None),
+                "kf_state": str(kf_state_hist[i]),
+
+                # 与 zed_tracker_deploy 保持一致的主KF字段
+                "kf_pos": _as_list_or_none(main_pos_hist[i]),
+                "kf_vel": _as_list_or_none(main_vel_hist[i]),
+                "kf_pos_var": _as_list_or_none(main_pos_var_hist[i]),
+                "kf_vel_var": _as_list_or_none(main_vel_var_hist[i]),
+                "innovation_r": _as_list_or_none(main_innovation_r_hist[i]),
+                "innovation_S_diag": _as_list_or_none(main_innovation_S_diag_hist[i]),
+                "normalized_innovation": _as_list_or_none(main_normalized_innovation_hist[i]),
+                "innovation_mahalanobis2": main_innovation_mahalanobis2_hist[i],
+
+                # offline 专用命名（保留兼容）
                 "kf_main_pos": _as_list_or_none(main_pos_hist[i]),
                 "kf_main_vel": _as_list_or_none(main_vel_hist[i]),
                 "main_did_upgrade": bool(did_upgrade_hist[i]),
                 "kf_future_pos": _as_list_or_none(future_pos_hist[i]),
                 "kf_future_vel": _as_list_or_none(future_vel_hist[i]),
+                "online_detection_fit_pos": _as_list_or_none(online_det_fit_pos_hist[i]),
+                "online_detection_fit_vel": _as_list_or_none(online_det_fit_vel_hist[i]),
             }
             for i, fr in enumerate(frames)
         ],
@@ -352,11 +523,14 @@ def _draw_result_on_ax(
     main_upgrade_seq = [bool(f.get("main_did_upgrade", False)) for f in frames]
     future_pos_seq = [None if f.get("kf_future_pos") is None else np.asarray(f["kf_future_pos"], dtype=float) for f in frames]
     future_vel_seq = [None if f.get("kf_future_vel") is None else np.asarray(f["kf_future_vel"], dtype=float) for f in frames]
+    online_fit_pos_seq = [None if f.get("online_detection_fit_pos") is None else np.asarray(f["online_detection_fit_pos"], dtype=float) for f in frames]
+    online_fit_vel_seq = [None if f.get("online_detection_fit_vel") is None else np.asarray(f["online_detection_fit_vel"], dtype=float) for f in frames]
 
     # 根据轨迹存储坐标系，适配到显示坐标系
     det_seq = _transform_seq_by_frames(det_seq, frames, src_frame, dst_frame)
     main_pos_seq = _transform_seq_by_frames(main_pos_seq, frames, src_frame, dst_frame)
     future_pos_seq = _transform_seq_by_frames(future_pos_seq, frames, src_frame, dst_frame)
+    online_fit_pos_seq = _transform_seq_by_frames(online_fit_pos_seq, frames, src_frame, dst_frame)
 
     # main / future / detection 三类信息均按全点显示
 
@@ -364,6 +538,7 @@ def _draw_result_on_ax(
     det_seq_vis = _scale_seq(det_seq, display_scale)
     main_pos_seq_vis = _scale_seq(main_pos_seq, display_scale)
     future_pos_seq_vis = _scale_seq(future_pos_seq, display_scale)
+    online_fit_pos_seq_vis = _scale_seq(online_fit_pos_seq, display_scale)
 
     ax.clear()
 
@@ -426,6 +601,26 @@ def _draw_result_on_ax(
         elif show_pos_values:
             _annotate_position_values(ax, future_pos_seq_vis, color="tab:orange", prefix="F", every=1)
 
+    online_xyz = _extract_xyz(online_fit_pos_seq_vis)
+    if show_positions and online_xyz is not None:
+        ax.plot(*online_xyz, "-.", color="tab:pink", linewidth=1.8, label="online det fit")
+        online_points = [p for p in online_fit_pos_seq_vis if p is not None]
+        if online_points:
+            online_arr = np.asarray(online_points, dtype=float)
+            ax.scatter(online_arr[:, 0], online_arr[:, 1], online_arr[:, 2], color="tab:pink", marker="s", s=20, alpha=0.9)
+
+        if show_speed:
+            _draw_speed_and_arrows(
+                ax,
+                online_fit_pos_seq_vis,
+                online_fit_vel_seq,
+                color="tab:pink",
+                arrow_len=0.03 * max(display_scale, 1e-6),
+                every=1,
+            )
+        elif show_pos_values:
+            _annotate_position_values(ax, online_fit_pos_seq_vis, color="tab:pink", prefix="O", every=1)
+
     # 起点标记
     start_main = _first_valid_point(main_pos_seq_vis)
     if show_positions and start_main is not None:
@@ -436,6 +631,11 @@ def _draw_result_on_ax(
     if show_positions and start_future is not None:
         ax.scatter(start_future[0], start_future[1], start_future[2], color="gold", marker="*", s=160, label="start_future")
         ax.text(start_future[0], start_future[1], start_future[2], "START_FUTURE", color="gold", fontsize=9)
+
+    start_online = _first_valid_point(online_fit_pos_seq_vis)
+    if show_positions and start_online is not None:
+        ax.scatter(start_online[0], start_online[1], start_online[2], color="tab:pink", marker="*", s=140, label="start_online_fit")
+        ax.text(start_online[0], start_online[1], start_online[2], "START_ONLINE_FIT", color="tab:pink", fontsize=8)
 
     # 坐标轴标签
     if dst_frame == "world":
@@ -482,7 +682,7 @@ def _draw_result_on_ax(
             _draw_axes(ax, world_origin_in_body * display_scale, world_rot_in_body, axis_len=axis_len * 0.8, alpha=0.65)
             ax.text(*(world_origin_in_body * display_scale), "WORLD@first", color="k", fontsize=8)
 
-    all_points = det_seq_vis + main_pos_seq_vis + future_pos_seq_vis
+    all_points = det_seq_vis + main_pos_seq_vis + future_pos_seq_vis + online_fit_pos_seq_vis
     _set_equal_aspect_3d(ax, all_points)
     _set_axis_ticks(ax, tick_step)
 
@@ -535,7 +735,7 @@ def _seq_to_xyz_arrays(seq):
 
 
 def plot_timeseries_components(result: dict[str, Any], png_path: Path):
-    """按真实时间步对比 main/future 的位置与速度分量。"""
+    """按真实时间步对比 main/future/online-fit 的位置与速度分量。"""
     frames = result["frames"]
     n = len(frames)
     t = np.arange(n, dtype=int)
@@ -544,31 +744,36 @@ def plot_timeseries_components(result: dict[str, Any], png_path: Path):
     main_vel_seq = [None if f["kf_main_vel"] is None else np.asarray(f["kf_main_vel"], dtype=float) for f in frames]
     future_pos_seq = [None if f["kf_future_pos"] is None else np.asarray(f["kf_future_pos"], dtype=float) for f in frames]
     future_vel_seq = [None if f["kf_future_vel"] is None else np.asarray(f["kf_future_vel"], dtype=float) for f in frames]
+    online_fit_pos_seq = [None if f.get("online_detection_fit_pos") is None else np.asarray(f["online_detection_fit_pos"], dtype=float) for f in frames]
+    online_fit_vel_seq = [None if f.get("online_detection_fit_vel") is None else np.asarray(f["online_detection_fit_vel"], dtype=float) for f in frames]
 
     mpx, mpy, mpz = _seq_to_xyz_arrays(main_pos_seq)
     mvx, mvy, mvz = _seq_to_xyz_arrays(main_vel_seq)
     fpx, fpy, fpz = _seq_to_xyz_arrays(future_pos_seq)
     fvx, fvy, fvz = _seq_to_xyz_arrays(future_vel_seq)
+    opx, opy, opz = _seq_to_xyz_arrays(online_fit_pos_seq)
+    ovx, ovy, ovz = _seq_to_xyz_arrays(online_fit_vel_seq)
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 9), sharex=True)
     ax_px, ax_py, ax_pz = axes[0, 0], axes[0, 1], axes[0, 2]
     ax_vx, ax_vy, ax_vz = axes[1, 0], axes[1, 1], axes[1, 2]
 
-    def _plot_pair(ax, y_main, y_future, title: str, ylabel: str):
+    def _plot_triplet(ax, y_main, y_future, y_online, title: str, ylabel: str):
         # 同一时间轴叠加比较，点+线同时显示。
         ax.plot(t, y_main, "-o", color="tab:blue", markersize=3.5, linewidth=1.4, label="main")
         ax.plot(t, y_future, "--^", color="tab:orange", markersize=3.5, linewidth=1.4, label="future")
+        ax.plot(t, y_online, "-.s", color="tab:pink", markersize=3.0, linewidth=1.3, label="online_det_fit")
         ax.set_title(title)
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
         ax.legend(loc="best")
 
-    _plot_pair(ax_px, mpx, fpx, "Position X", "x (m)")
-    _plot_pair(ax_py, mpy, fpy, "Position Y", "y (m)")
-    _plot_pair(ax_pz, mpz, fpz, "Position Z", "z (m)")
-    _plot_pair(ax_vx, mvx, fvx, "Velocity X", "vx (m/s)")
-    _plot_pair(ax_vy, mvy, fvy, "Velocity Y", "vy (m/s)")
-    _plot_pair(ax_vz, mvz, fvz, "Velocity Z", "vz (m/s)")
+    _plot_triplet(ax_px, mpx, fpx, opx, "Position X", "x (m)")
+    _plot_triplet(ax_py, mpy, fpy, opy, "Position Y", "y (m)")
+    _plot_triplet(ax_pz, mpz, fpz, opz, "Position Z", "z (m)")
+    _plot_triplet(ax_vx, mvx, fvx, ovx, "Velocity X", "vx (m/s)")
+    _plot_triplet(ax_vy, mvy, fvy, ovy, "Velocity Y", "vy (m/s)")
+    _plot_triplet(ax_vz, mvz, fvz, ovz, "Velocity Z", "vz (m/s)")
 
     for ax in axes[1, :]:
         ax.set_xlabel("Time Step")
@@ -584,7 +789,7 @@ def plot_timeseries_components(result: dict[str, Any], png_path: Path):
 
     tracker_id = result.get("meta", {}).get("tracker_id", "?")
     predict_n = result.get("meta", {}).get("predict_n", "?")
-    fig.suptitle(f"KF Components vs Time Step | tracker={tracker_id} | predict+N={predict_n}")
+    fig.suptitle(f"KF Components vs Time Step | tracker={tracker_id} | predict+N={predict_n} | +online_det_fit")
     fig.tight_layout()
     fig.savefig(png_path, dpi=150)
     plt.close(fig)
@@ -744,11 +949,14 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tracker_params = _load_tracker_params(config_path)
-    predict_n = int(
+    offline_cfg = tracker_params.get("offline", {})
+    enable_offline_predict_n = bool(offline_cfg.get("enable_predict_n", tracker_params.get("enable_offline_predict_n", True)))
+    predict_n_from_cfg_or_arg = int(
         args.predict_n
         if args.predict_n is not None
-        else tracker_params.get("predict_n", 8)
+        else offline_cfg.get("predict_n", tracker_params.get("predict_n", 8))
     )
+    predict_n = predict_n_from_cfg_or_arg if enable_offline_predict_n else 0
 
     json_files = sorted(traj_dir.glob("trajectory_tracker*_*.json"))
     if not json_files:
@@ -756,6 +964,7 @@ def main():
         return
 
     print(f"Found {len(json_files)} trajectories. Start offline replay...")
+    print(f"enable_offline_predict_n = {enable_offline_predict_n}")
     print(f"predict_n = {predict_n}")
     print(f"output_dir = {output_dir}")
     all_items: list[dict[str, Any]] = []

@@ -1,57 +1,267 @@
-# ZED Subscriber（已按当前代码更新）
+# zed_subscriber 使用说明（按当前代码）
 
-基于当前仓库代码（2026-04-01）整理的使用说明。
+本文档覆盖当前目录下全部主要脚本，并补充了最新改动（2026-04-05）。
 
-## 快速导航（以此为准）
+## 0. 快速开始
 
-### 核心脚本
+```bash
+# 1) 在线追踪（会生成 trajectory_data/*.json）
+python3 zed_tracker_deploy.py
 
-- `zed_tracker_deploy.py`：在线 ROS2 追踪主节点（发布 `catch_info` / `/ball_markers`）
-- `perception.py`：检测 + 多目标关联 + 3D 卡尔曼滤波核心
-- `Tracker_config.yaml`：相机内外参与追踪参数
-- `visualize_Tracker_3d.py`：Open3D 交互式 3D 可视化（支持 `--add-gt-pos` 回写）
-- `offline_kf_from_trajectory.py`：离线 KF 重放与对比图导出
-- `cacu_noise.py`：拟合与误差统计（`ols/ransac/huber`）
-- `zed_image_saver.py`：RGB/Depth 同步采集调试工具（`--save` 开启保存）
+# 2) 可选：给轨迹补写 gt_pos
+python3 visualize_Tracker_3d.py --add-gt-pos
 
-### 已确认的轨迹目录与字段
+# 3) 离线 KF 重放与导图
+python3 offline_kf_from_trajectory.py --trajectory-dir trajectory_data
 
-- 在线追踪保存目录：`trajectory_data/`
-- 每条轨迹：`trajectory_tracker{ID}_{time}_{counter}.json` + 同名图像子目录
-- 帧字段包含：
-  - `detection_pos`
-  - `kf_pos`
-  - `kf_vel`
-  - `kf_state`（`upgrade`/`predict`）
-  - `rgb_file`
-  - `rgb_overlay_file`
-  - `depth_file`
-- 轨迹顶层包含：`coord_frame`（`body`/`world`）
+# 4) 全局误差统计 + 每轨迹图
+python3 cacu_noise.py --trajectory-dir trajectory_data --no-show
 
-### 关键变化（相对旧文档）
+# 5) MuJoCo 回放对比
+python3 visuization_in_mujoco.py --trajectory-dir trajectory_data
+```
 
-- 当前 3D 可视化脚本名是：`visualize_Tracker_3d.py`（不是 `visualize_trajectory_3d.py`）
-- 当前目录不存在：`visualize_trajectory.py`、`detection_process.py`
-- `zed_tracker_deploy.py` 启动时会清空 `trajectory_data/`
+---
+
+## 1. 脚本总览
+
+- `zed_tracker_deploy.py`：在线 ROS2 追踪主节点（发布 `catch_info`、`/ball_markers`）
+- `perception.py`：检测/关联/KF 核心实现（被主节点与离线脚本调用）
+- `Tracker_config.yaml`：统一参数入口（相机、追踪、离线参数）
+- `visualize_Tracker_3d.py`：Open3D 交互可视化；支持 `--add-gt-pos` 回写
+- `offline_kf_from_trajectory.py`：离线重放主 KF 与可选 future 轨迹
+- `cacu_noise.py`：拟合与误差统计（全局+单轨迹）
+- `visuization_in_mujoco.py`：MuJoCo 回放与误差对比
+- `zed_image_saver.py`：RGB/Depth 采集调试工具
+
+---
+
+## 2. 配置文件（Tracker_config.yaml）
+
+关键段：
+- `camera`: 输入 profile、topic、undistort
+- `intrinsics` / `extrinsics`: 相机参数
+- `tracker.runtime / association / detector / kalman / trajectory`
+- `tracker.offline`: 离线回放参数
+
+### 离线 N 步预测开关（重要）
+
+```yaml
+tracker:
+  offline:
+    enable_predict_n: false
+```
+
+当为 `false` 时：
+- `offline_kf_from_trajectory.py` 中 `predict_n` 会被强制为 `0`
+- 不生成 `kf_future_pos/kf_future_vel`
+- 3D 图和时序图都不会出现 “KF predict +N step” 轨迹
+
+---
+
+## 3. 在线追踪：zed_tracker_deploy.py
+
+### 功能
+- 同步订阅 RGB/Depth
+- 使用 `BallTracker` 做检测、关联、卡尔曼滤波
+- 发布：
+  - `catch_info` (`Float32MultiArray`)
+  - `/ball_markers` (`MarkerArray`)
+- 保存轨迹到 `trajectory_data/`
+
+### 用法
+
+```bash
+python3 zed_tracker_deploy.py
+```
+
+### 注意
+- 启动时会清空并重建 `trajectory_data/`
+
+---
+
+## 4. 图像采集：zed_image_saver.py
+
+### 用法
+
+```bash
+# 仅显示
+python3 zed_image_saver.py
+
+# 启动即保存
+python3 zed_image_saver.py --save
+```
+
+参数：
+- `--save`：启动后自动保存
+
+---
+
+## 5. 轨迹 Open3D 可视化：visualize_Tracker_3d.py
 
 ### 常用命令
 
 ```bash
-# 在线追踪
-python3 zed_tracker_deploy.py
-
-# 3D 可视化（自动扫描 trajectory_data）
+# 自动扫描 trajectory_data 下全部轨迹
 python3 visualize_Tracker_3d.py
 
-# 离线 KF 重放
-python3 offline_kf_from_trajectory.py --trajectory-dir trajectory_data
+# 单轨迹
+python3 visualize_Tracker_3d.py trajectory_data/trajectory_tracker0_xxx.json
 
-# 误差统计
-python3 cacu_noise.py --trajectory-dir trajectory_data --no-show
+# 指定帧范围
+python3 visualize_Tracker_3d.py trajectory_data/trajectory_tracker0_xxx.json --start 10 --end 80
 
-# 图像采集（启动即保存）
-python3 zed_image_saver.py --save
+# 将拟合 GT 写回 gt_pos（会生成 .bak）
+python3 visualize_Tracker_3d.py --add-gt-pos
 ```
+
+主要参数：
+- `trajectory_file`（可选）
+- `--dir`
+- `--start`, `--end`
+- `--cam-height`, `--cam-forward`, `--cam-lateral`
+- `--enable-x-filter`, `--x-max`
+- `--hide-gt-marker`
+- `--no-pre-stats`
+- `--add-gt-pos`
+
+---
+
+## 6. 离线 KF 重放：offline_kf_from_trajectory.py
+
+### 在线 detection fit（新增）
+- 每一帧基于“截至当前帧”的 detection 做在线 OLS 拟合：
+  - `x/y`：一次拟合
+  - `z`：二次拟合（样本不足时自动降阶）
+- 有 detection 的帧：直接在该时间戳读取拟合位置/速度。
+- 无 detection 的帧：使用最近一次拟合得到的 `pos/vel` 按运动学外推（含重力项）补全。
+- 结果写入离线 JSON：
+  - `online_detection_fit_pos`
+  - `online_detection_fit_vel`
+- 3D 图与时序图会在对应时间戳绘制该在线拟合轨迹（`online_det_fit`，粉色）。
+
+### 常用命令
+
+```bash
+# 默认目录与配置
+python3 offline_kf_from_trajectory.py
+
+# 指定目录与配置
+python3 offline_kf_from_trajectory.py \
+  --trajectory-dir trajectory_data \
+  --config Tracker_config.yaml
+
+# 仅导出，不打开交互窗口
+python3 offline_kf_from_trajectory.py --no-interactive
+```
+
+参数：
+- `--trajectory-dir`
+- `--config`
+- `--predict-n`
+- `--annotate-every`
+- `--no-interactive`
+- `--output-dir`
+- `--display-scale`
+- `--tick-step`
+- `--display-frame {auto,world,body}`
+- `--frame-axes-every`
+
+输出：
+- `*_offline_kf.json`
+- `*_offline_kf_3d.png`
+- `*_offline_kf_timeseries.png`
+
+JSON 每帧除 `kf_main_* / kf_future_*` 外，还包含：
+- `online_detection_fit_pos`
+- `online_detection_fit_vel`
+
+---
+
+## 7. 误差统计：cacu_noise.py
+
+### 功能
+- 拟合轨迹（`ols/ransac/huber`）
+- 输出全局统计 + 每轨迹图（位置/速度/创新量/方差）
+
+### 当前全局统计定义（已统一）
+启动先打印：
+1. `kf_update - gt_fit（全时段）`
+2. `kf_update - gt_fit（仅下降段 vz<=0）`
+3. `online_det_fit - gt_fit（全时段）`
+4. `online_det_fit - gt_fit（仅下降段 vz<=0）`
+
+并且：
+- 轨迹 JSON 若已有 `online_detection_fit_pos/online_detection_fit_vel`，优先使用
+- 缺失时自动在线重算
+
+### 用法
+
+```bash
+python3 cacu_noise.py --trajectory-dir trajectory_data --no-show
+```
+
+参数：
+- `--trajectory-dir`
+- `--output-dir`
+- `--fit-method {ols,ransac,huber}`
+- `--fit-source {detection,gt}`（影响图中拟合线来源）
+- `--no-show`
+
+---
+
+## 8. MuJoCo 回放：visuization_in_mujoco.py
+
+### 功能
+- 将轨迹映射到 MuJoCo 回放
+- 对比 `KF / Kinematic / GT-Kinematic / Sim`
+- 轨迹结束自动保存误差图与状态图
+
+### 启动即打印的全局统计（已新增）
+- `KF - GT-Kinematic`
+- `Kinematic - GT-Kinematic`
+- 以及当前模式下的 `KF - Sim` 或 `Kinematic - Sim`
+
+### 用法
+
+```bash
+# 默认模型 + 默认 trajectory_data
+python3 visuization_in_mujoco.py
+
+# 指定模型和轨迹目录
+python3 visuization_in_mujoco.py \
+  --model assets/mjcf/h1_juggling_camera.xml \
+  --trajectory-dir trajectory_data
+
+# 初始化来源
+python3 visuization_in_mujoco.py --init-source kf
+python3 visuization_in_mujoco.py --init-source detection
+```
+
+参数：
+- `--model`
+- `--trajectory-dir`
+- `--init-source {kf,detection}`
+
+键盘：
+- `←/→`：前后帧
+- `↑/↓`：前后轨迹
+- `Space`：播放/暂停
+
+---
+
+## 9. 常见问题
+
+### Q1. 为什么没有 future 预测轨迹？
+`Tracker_config.yaml` 中 `tracker.offline.enable_predict_n: false` 时是预期行为。
+
+### Q2. `mujoco` 导入失败
+说明当前解释器未安装 MuJoCo 依赖，请在运行该脚本的环境中安装。
+
+### Q3. 找不到轨迹文件
+确认目录与命名：
+- 目录：`trajectory_data/`
+- 文件：`trajectory_tracker*_*.json`
 
 <!--
 

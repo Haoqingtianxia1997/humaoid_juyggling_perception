@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime outputs
+*.log
+*.tmp
+
+# Generated trajectory data (images/depth/plots/json)
+trajectory_data/
+
+# Optional large media/data dirs
+data/
