@@ -133,7 +133,7 @@ tracker:
     # 中心点计算方法
     center_method: "nearest" # "min_depth"
     # RGB图像四周center无效边框像素宽度（仅用于center校验）
-    center_border_pixels: 50
+    center_border_pixels: 30
     # 轮廓检测形状约束（MultiRedBallDetector）
     min_area: 500
     max_area: 9000
@@ -152,14 +152,31 @@ tracker:
     # 空气阻力系数（典型值0.1-1.0）
     drag_coefficient: 0.0
     # ===== KalmanFilter3D 鲁棒更新参数（soft/hard gating） =====
-    enable_axiswise_outlier_rejection: false
-    axis_soft_gate_threshold: [2.0, 2.0, 2.0]
-    axis_hard_gate_threshold: [3.5, 3.5, 3.5]
+    enable_axiswise_outlier_rejection: true
+    axis_soft_gate_threshold: [3.0, 3.0, 4.0]
+    axis_hard_gate_threshold: [3.5, 3.5, 5.5]
     axis_abs_residual_threshold: null #[0.03, 0.02, 0.05]
     min_soft_weight: 0.05
     rejection_cov_inflation: [2, 2, 4]
     rejection_position_inflate_std: [0.02, 0.02, 0.03]
     rejection_velocity_inflate_std: [0.20, 0.20, 0.30]
+
+    # ===== 在线 detection OLS 拟合参数 =====
+    # 是否启用在线拟合（每次 update 用历史 detection 重拟合）
+    enable_online_detection_fit: true
+    # 拟合历史窗口长度（帧）
+    online_fit_max_history: 90
+    # x/y 方向多项式阶数（推荐 1）
+    online_fit_xy_degree: 1
+    # z 方向多项式阶数（推荐 2）
+    online_fit_z_degree: 2
+    # 默认对外状态来源："kf" / "online_fit"
+    active_state_source: "kf"
+    # predict source
+    predict_source: "online_fit"
+    # update source
+    update_source: "kf"
+
 
   # 轨迹输出参数
   trajectory:
@@ -175,7 +192,8 @@ tracker:
     predict_n: 5
 
   # 是否可视化ICP过程
-  visualize_icp: False
+  visualize_icp: false
+
 
 
 # 测试模式配置

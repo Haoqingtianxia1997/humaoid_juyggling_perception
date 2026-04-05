@@ -1078,6 +1078,34 @@ class KalmanFilter3D:
             'rejection_velocity_inflate_std',
             cfg_src.get('rejection_velocity_inflate_std'),
         )
+        enable_online_detection_fit = kalman_cfg.get(
+            'enable_online_detection_fit',
+            cfg_src.get('enable_online_detection_fit', True),
+        )
+        online_fit_max_history = kalman_cfg.get(
+            'online_fit_max_history',
+            cfg_src.get('online_fit_max_history', 90),
+        )
+        online_fit_xy_degree = kalman_cfg.get(
+            'online_fit_xy_degree',
+            cfg_src.get('online_fit_xy_degree', 1),
+        )
+        online_fit_z_degree = kalman_cfg.get(
+            'online_fit_z_degree',
+            cfg_src.get('online_fit_z_degree', 2),
+        )
+        active_state_source = kalman_cfg.get(
+            'active_state_source',
+            cfg_src.get('active_state_source', 'kf'),
+        )
+        predict_source = kalman_cfg.get(
+            'predict_source',
+            cfg_src.get('predict_source', 'kf'),
+        )
+        update_source = kalman_cfg.get(
+            'update_source',
+            cfg_src.get('update_source', 'kf'),
+        )
 
         required = {
             'dt': dt,
@@ -1127,7 +1155,27 @@ class KalmanFilter3D:
             rejection_velocity_inflate_std, dtype=float
         ).reshape(3)
 
-        # 状态向量 [x, y, z, vx, vy, vz]
+        self.enable_online_detection_fit = bool(enable_online_detection_fit)
+        self.online_fit_max_history = int(max(3, online_fit_max_history))
+        self.online_fit_xy_degree = int(max(0, online_fit_xy_degree))
+        self.online_fit_z_degree = int(max(0, online_fit_z_degree))
+        self.active_state_source = str(active_state_source).strip().lower()
+        if self.active_state_source not in {'kf', 'online_fit'}:
+            self.active_state_source = 'kf'
+
+        self.predict_source = str(predict_source).strip().lower()
+        if self.predict_source not in {'kf', 'online_fit'}:
+            self.predict_source = 'kf'
+
+        self.update_source = str(update_source).strip().lower()
+        if self.update_source not in {'kf', 'online_fit'}:
+            self.update_source = 'kf'
+        
+        # 双状态：KF / 在线OLS拟合
+        self.kf_x = np.zeros(6, dtype=float)
+        self.online_fit_x = np.zeros(6, dtype=float)
+
+        # 对外状态向量（由状态机选择来源）
         self.x = np.zeros(6, dtype=float)
 
         # 状态协方差矩阵
@@ -1197,6 +1245,109 @@ class KalmanFilter3D:
         self.last_axis_accepted_mask = None     # shape (3,), bool
         self.last_update_accepted = None        # bool，是否至少有一个轴被采纳
 
+        # 在线 detection OLS 拟合缓存与时序
+        self.online_fit_initialized = False
+        self.online_fit_last_update_time = None
+        self._det_fit_times = []
+        self._det_fit_points = []
+
+        # 滤波内部时钟（秒）
+        self.filter_time_sec = 0.0
+
+    @staticmethod
+    def _fit_axis_online_ols(times, values, degree):
+        """在线前缀 OLS：返回可用于 np.polyval 的系数；样本不足时返回 None。"""
+        t = np.asarray(times, dtype=float).reshape(-1)
+        y = np.asarray(values, dtype=float).reshape(-1)
+        valid = np.isfinite(t) & np.isfinite(y)
+        t = t[valid]
+        y = y[valid]
+        if t.size == 0:
+            return None
+        deg = int(max(0, degree))
+        need = deg + 1
+        if deg >= 1 and t.size >= need and np.ptp(t) > 1e-12:
+            return np.polyfit(t, y, deg)
+        return np.asarray([float(y[-1])], dtype=float)
+
+    @staticmethod
+    def _poly_eval_and_derivative(coef, t):
+        c = np.asarray(coef, dtype=float).reshape(-1)
+        pos = float(np.polyval(c, t))
+        if c.size <= 1:
+            vel = 0.0
+        else:
+            vel = float(np.polyval(np.polyder(c), t))
+        return pos, vel
+
+    def _append_detection_sample(self, measurement, t_obs):
+        p = np.asarray(measurement, dtype=float).reshape(3)
+        self._det_fit_times.append(float(t_obs))
+        self._det_fit_points.append(p.copy())
+        if len(self._det_fit_times) > self.online_fit_max_history:
+            over = len(self._det_fit_times) - self.online_fit_max_history
+            if over > 0:
+                self._det_fit_times = self._det_fit_times[over:]
+                self._det_fit_points = self._det_fit_points[over:]
+
+    def _refresh_online_fit_state_from_history(self, t_eval):
+        if not self.enable_online_detection_fit:
+            return
+        if len(self._det_fit_times) == 0:
+            return
+
+        tp = np.asarray(self._det_fit_times, dtype=float)
+        pp = np.asarray(self._det_fit_points, dtype=float)
+
+        coef_x = self._fit_axis_online_ols(tp, pp[:, 0], degree=self.online_fit_xy_degree)
+        coef_y = self._fit_axis_online_ols(tp, pp[:, 1], degree=self.online_fit_xy_degree)
+        coef_z = self._fit_axis_online_ols(tp, pp[:, 2], degree=self.online_fit_z_degree)
+
+        if coef_x is None or coef_y is None or coef_z is None:
+            return
+
+        t_use = float(t_eval)
+        px, vx = self._poly_eval_and_derivative(coef_x, t_use)
+        py, vy = self._poly_eval_and_derivative(coef_y, t_use)
+        pz, vz = self._poly_eval_and_derivative(coef_z, t_use)
+
+        self.online_fit_x[:3] = np.array([px, py, pz], dtype=float)
+        self.online_fit_x[3:] = np.array([vx, vy, vz], dtype=float)
+        self.online_fit_initialized = True
+        self.online_fit_last_update_time = t_use
+
+    def _predict_online_fit_state(self, dt):
+        if not self.enable_online_detection_fit or not self.online_fit_initialized:
+            return
+
+        dt = float(dt)
+        if not (np.isfinite(dt) and dt > 0.0):
+            return
+
+        pos = self.online_fit_x[:3].copy()
+        vel = self.online_fit_x[3:].copy()
+
+        a_gravity = np.array([0.0, 0.0, -self.g], dtype=float)
+        a_drag, _ = self._compute_drag_acceleration_and_jacobian(vel)
+        a_total = a_gravity + a_drag
+
+        pos_new = pos + vel * dt + 0.5 * a_total * dt**2
+        vel_new = vel + a_total * dt
+
+        self.online_fit_x[:3] = pos_new
+        self.online_fit_x[3:] = vel_new
+
+
+    def _sync_public_state(self):
+        source = self.active_state_source 
+        if source == 'online_fit' and self.online_fit_initialized:
+            self.x = self.online_fit_x.copy()
+            self.active_state_source = 'online_fit'
+        else:
+            self.x = self.kf_x.copy()
+            self.active_state_source = 'kf'
+
+
     def initialize(self, position, velocity=None):
         """
         初始化滤波器状态
@@ -1208,14 +1359,25 @@ class KalmanFilter3D:
         if velocity is None:
             velocity = np.zeros(3, dtype=float)
 
-        self.x[:3] = np.asarray(position, dtype=float)
-        self.x[3:] = np.asarray(velocity, dtype=float)
+        self.kf_x[:3] = np.asarray(position, dtype=float)
+        self.kf_x[3:] = np.asarray(velocity, dtype=float)
+
+        self.online_fit_x[:3] = np.asarray(position, dtype=float)
+        self.online_fit_x[3:] = np.asarray(velocity, dtype=float)
+        self.online_fit_initialized = True
 
         # 初始协方差：位置较确定，速度稍不确定
         self.P = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]).astype(float)
         self.velocity_uncertainty = np.diag(self.P)[3:]
 
+        t0 = float(self.filter_time_sec)
+        self.filter_time_sec = float(t0)
+        self.online_fit_last_update_time = float(t0)
+        self._det_fit_times = [float(t0)]
+        self._det_fit_points = [np.asarray(position, dtype=float).reshape(3).copy()]
+
         self.initialized = True
+        self._sync_public_state()
 
     def _compute_drag_acceleration_and_jacobian(self, velocity):
         """
@@ -1257,7 +1419,7 @@ class KalmanFilter3D:
         """
         measurement = np.asarray(measurement, dtype=float)
 
-        y = measurement - self.H @ self.x
+        y = measurement - self.H @ self.kf_x
         S = self.H @ self.P @ self.H.T + self.R
 
         S_diag = np.diag(S).astype(float)
@@ -1290,27 +1452,27 @@ class KalmanFilter3D:
         for i in range(3):
            
            
-            # if nu[i] <= soft[i]:
-            #     weights[i] = 1.0
-            # elif nu[i] <= hard[i]:
-            #     # 软衰减：越离谱，权重越小
-            #     weights[i] = max((soft[i] / max(nu[i], 1e-12)) ** 2, self.min_soft_weight)
-            # else:
-            #     weights[i] = 0.0
-           
-           
-            nu_i = float(max(nu[i], 0.0))
-            soft_i = float(max(soft[i], 1e-12))
-            hard_i = float(max(hard[i], soft_i))
-
-            if nu_i > hard_i:
-                # 超过硬门限：拒绝
-                weights[i] = 0.0
+            if nu[i] <= soft[i]:
+                weights[i] = 1.0
+            elif nu[i] <= hard[i]:
+                # 软衰减：越离谱，权重越小
+                weights[i] = max((soft[i] / max(nu[i], 1e-12)) ** 2, self.min_soft_weight)
             else:
-                # 在可接受区间内采用连续衰减：
-                # nu 越小，weight 越接近 1；nu 越大，weight 越小
-                w = np.exp(-0.5 * (nu_i / soft_i) ** 2)
-                weights[i] = float(np.clip(w, self.min_soft_weight, 1.0))
+                weights[i] = 0.0
+           
+           
+            # nu_i = float(max(nu[i], 0.0))
+            # soft_i = float(max(soft[i], 1e-12))
+            # hard_i = float(max(hard[i], soft_i))
+
+            # if nu_i > hard_i:
+            #     # 超过硬门限：拒绝
+            #     weights[i] = 0.0
+            # else:
+            #     # 在可接受区间内采用连续衰减：
+            #     # nu 越小，weight 越接近 1；nu 越大，weight 越小
+            #     w = np.exp(-0.5 * (nu_i / soft_i) ** 2)
+            #     weights[i] = float(np.clip(w, self.min_soft_weight, 1.0))
 
         # 绝对残差硬拒绝
         if self.axis_abs_residual_threshold is not None:
@@ -1343,8 +1505,8 @@ class KalmanFilter3D:
         start_time = time.perf_counter() if self.verbose else None
 
         dt = self.dt
-        pos = self.x[:3].copy()
-        vel = self.x[3:].copy()
+        pos = self.kf_x[:3].copy()
+        vel = self.kf_x[3:].copy()
 
         a_gravity = np.array([0.0, 0.0, -self.g], dtype=float)
         a_drag, J_drag = self._compute_drag_acceleration_and_jacobian(vel)
@@ -1354,8 +1516,8 @@ class KalmanFilter3D:
         pos_new = pos + vel * dt + 0.5 * a_total * dt**2
         vel_new = vel + a_total * dt
 
-        self.x[:3] = pos_new
-        self.x[3:] = vel_new
+        self.kf_x[:3] = pos_new
+        self.kf_x[3:] = vel_new
 
         # 线性化雅可比
         I3 = np.eye(3, dtype=float)
@@ -1374,17 +1536,30 @@ class KalmanFilter3D:
         self.P = 0.5 * (self.P + self.P.T)
         self.velocity_uncertainty = np.diag(self.P)[3:]
 
+        # 在线拟合状态在 predict 阶段按动力学外推
+        self._predict_online_fit_state(dt)
+
+        # 推进滤波内部时钟
+        self.filter_time_sec = float(self.filter_time_sec) + float(dt)
+
+        if self.predict_source == "online_fit":
+            self.active_state_source = "online_fit"
+        else:
+            self.active_state_source = "kf"     
+                   
+        # 同步对外状态
+        self._sync_public_state()
+
         if self.verbose:
             elapsed_time = (time.perf_counter() - start_time) * 1000.0
             print(f"[KF Predict] 耗时: {elapsed_time:.4f}ms")
 
-    def update(self, measurement, current_time=None):
+    def update(self, measurement):
         """
         更新步骤（逐轴 soft/hard gating + 弱更新）
 
         Args:
             measurement: 观测值 [x, y, z]
-            current_time: 当前时间（保留接口兼容性）
 
         Returns:
             accepted: bool
@@ -1412,6 +1587,11 @@ class KalmanFilter3D:
                 elapsed_time = (time.perf_counter() - start_time) * 1000.0
                 print(f"[KF Update-Init] 耗时: {elapsed_time:.4f}ms")
             return True
+
+        # 记录当前update时刻与检测观测，并重拟合在线OLS状态
+        t_obs = float(self.filter_time_sec)
+        self._append_detection_sample(measurement, t_obs)
+        self._refresh_online_fit_state_from_history(t_obs)
 
         # 1) 完整创新统计
         y, S, S_diag, nu, d2 = self._compute_innovation_statistics(measurement)
@@ -1450,12 +1630,13 @@ class KalmanFilter3D:
                     f"normalized_innovation={nu}, "
                     f"耗时: {elapsed_time:.4f}ms"
                 )
+            self._sync_public_state()
             return False
 
         # 4) 只取被接受的轴，并对弱更新轴增大等效 R
         H_sel = self.H[accepted_indices, :]
         z_sel = measurement[accepted_indices]
-        y_sel = z_sel - H_sel @ self.x
+        y_sel = z_sel - H_sel @ self.kf_x
 
         R_diag = np.diag(self.R).astype(float)
         R_eff_diag = []
@@ -1474,7 +1655,7 @@ class KalmanFilter3D:
             K = PHt @ np.linalg.pinv(S_sel)
 
         # 5) 状态更新
-        self.x = self.x + K @ y_sel
+        self.kf_x = self.kf_x + K @ y_sel
 
         # Joseph form 协方差更新
         I = np.eye(6, dtype=float)
@@ -1503,7 +1684,12 @@ class KalmanFilter3D:
                 f"normalized_innovation={nu}, "
                 f"耗时: {elapsed_time:.4f}ms"
             )
-
+       
+        if self.update_source == "online_fit":
+            self.active_state_source = "online_fit"
+        else:
+            self.active_state_source = "kf" 
+             
         return True
 
     def get_state(self):
@@ -1511,12 +1697,27 @@ class KalmanFilter3D:
         if not self.initialized:
             return None
 
+        self._sync_public_state()
         p_diag = np.diag(self.P).astype(float)
+
+        fit_pos = self.online_fit_x[:3].copy() if self.online_fit_initialized else None
+        fit_vel = self.online_fit_x[3:].copy() if self.online_fit_initialized else None
 
         return {
             'position': self.x[:3].copy(),
             'velocity': self.x[3:].copy(),
             'full_state': self.x.copy(),
+            'state_source': self.active_state_source,
+
+            'kf_position': self.kf_x[:3].copy(),
+            'kf_velocity': self.kf_x[3:].copy(),
+            'kf_full_state': self.kf_x.copy(),
+
+            'online_fit_position': fit_pos,
+            'online_fit_velocity': fit_vel,
+            'online_fit_full_state': None if not self.online_fit_initialized else self.online_fit_x.copy(),
+            'online_fit_initialized': bool(self.online_fit_initialized),
+            'online_fit_last_update_time': self.online_fit_last_update_time,
 
             'position_uncertainty': p_diag[:3].copy(),
             'velocity_uncertainty': self.velocity_uncertainty.copy(),
@@ -1556,6 +1757,7 @@ class KalmanFilter3D:
         if self.update_count < min_updates:
             return None, None
 
+        self._sync_public_state()
         velocity_uncertainty = np.diag(self.P)[3:]
         if np.any(velocity_uncertainty > max_velocity_uncertainty):
             return None, None
@@ -1617,9 +1819,18 @@ class KalmanFilter3D:
 
     def reset(self):
         """重置滤波器"""
+        self.kf_x = np.zeros(6, dtype=float)
+        self.online_fit_x = np.zeros(6, dtype=float)
         self.x = np.zeros(6, dtype=float)
         self.P = np.eye(6, dtype=float) * 10.0
         self.velocity_uncertainty = np.diag(self.P)[3:]
+
+        self.online_fit_initialized = False
+        self.online_fit_last_update_time = None
+        self._det_fit_times = []
+        self._det_fit_points = []
+        self.filter_time_sec = 0.0
+        self.active_state_source = 'kf'
 
         self.initialized = False
         self.update_count = 0
@@ -1637,6 +1848,8 @@ class KalmanFilter3D:
         self.last_axis_weights = None
         self.last_axis_accepted_mask = None
         self.last_update_accepted = None
+
+        self._sync_public_state()
 
 
 class MultiRedBallDetector:

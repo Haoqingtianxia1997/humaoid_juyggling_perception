@@ -43,15 +43,18 @@ class TrajectoryVisualizer:
         self.tracker_id = self.trajectory['tracker_id']
         self.frames = self.trajectory['frames']
         self.image_dir = self.data_dir / self.trajectory['image_dir']
-        self.coord_frame = str(self.trajectory.get('coord_frame', 'body')).lower()
-        if self.coord_frame not in ('body', 'world'):
-            print(f"警告: 未知coord_frame={self.coord_frame}，回退为body")
-            self.coord_frame = 'body'
+        self.data_coord_frame = str(self.trajectory.get('coord_frame', 'body')).lower()
+        if self.data_coord_frame not in ('body', 'world'):
+            print(f"警告: 未知coord_frame={self.data_coord_frame}，回退为body")
+            self.data_coord_frame = 'body'
+
+        # 当前可视化/处理坐标系（默认跟随轨迹数据坐标系）
+        self.coord_frame = self.data_coord_frame
         
         print(f"Loaded trajectory for tracker {self.tracker_id}")
         print(f"Total frames: {len(self.frames)}")
         print(f"Image directory: {self.image_dir}")
-        print(f"Trajectory coordinate frame: {self.coord_frame}")
+        print(f"Trajectory coordinate frame: {self.data_coord_frame}")
         
         # 加载相机配置
         config_path = Path(__file__).parent / 'Tracker_config.yaml'
@@ -87,7 +90,7 @@ class TrajectoryVisualizer:
         self.camera_to_body_transform[:3, :3] = camera_rotation_in_body
         self.camera_to_body_transform[:3, 3] = camera_position_in_body
 
-        # 点云过滤开关：True时剔除 x > self.x_filter_threshold 的点
+        # 点云过滤开关：True时剔除 body_x > self.x_filter_threshold 的点
         self.enable_x_filter = False
         self.x_filter_threshold = 1.0
 
@@ -98,7 +101,7 @@ class TrajectoryVisualizer:
         # Ground truth（由点云拟合）显示开关与球半径
         self.show_ground_truth_marker = True
         self.ball_radius = 0.0375
-        # GT有效点云范围：仅使用 x <= 1.0m 的点
+        # GT有效点云范围：仅使用 x <= 0.7m 的点
         self.gt_max_x = 0.7
 
         # 轨迹线显示开关（交互3D）
@@ -151,6 +154,81 @@ class TrajectoryVisualizer:
                 return body_to_world[:3, :3] @ cam_pos_body + body_to_world[:3, 3]
 
         return cam_pos_body
+
+    def _convert_points_between_frames(self, points, source_frame, target_frame, frame=None):
+        """
+        在body/world之间转换点坐标。
+
+        Args:
+            points: Nx3点数组或(3,)单点
+            source_frame: 'body' 或 'world'
+            target_frame: 'body' 或 'world'
+            frame: 当前帧（用于读取body位姿）
+
+        Returns:
+            转换后的点数组（保持输入形状），若无法转换返回None
+        """
+        pts = np.asarray(points, dtype=np.float64)
+        if pts.size == 0:
+            return pts.copy()
+
+        reshape_back = False
+        if pts.ndim == 1:
+            pts = pts.reshape(1, 3)
+            reshape_back = True
+
+        source = str(source_frame).lower()
+        target = str(target_frame).lower()
+
+        if source == target:
+            out = pts.copy()
+            return out.reshape(3) if reshape_back else out
+
+        if source == 'body' and target == 'world':
+            T = self._get_body_to_world_transform(frame)
+        elif source == 'world' and target == 'body':
+            T = self._get_world_to_body_transform(frame)
+        else:
+            return None
+
+        if T is None:
+            return None
+
+        R = T[:3, :3]
+        t = T[:3, 3]
+        out = (R @ pts.T).T + t
+        return out.reshape(3) if reshape_back else out
+
+    def _convert_point_between_frames(self, point, source_frame, target_frame, frame=None):
+        """单点版本坐标系转换。"""
+        return self._convert_points_between_frames(point, source_frame, target_frame, frame=frame)
+
+    def _build_gt_body_x_mask(self, points_current, frame=None):
+        """
+        构造 GT 过滤掩码：始终按 body 坐标系的 x <= self.gt_max_x 过滤。
+
+        Args:
+            points_current: 当前显示坐标系下的点云 Nx3
+            frame: 当前帧（当当前坐标系为 world 时需要用于 world->body）
+
+        Returns:
+            mask: bool[N]
+        """
+        pts = np.asarray(points_current, dtype=np.float64)
+        if pts.size == 0:
+            return np.zeros((0,), dtype=bool)
+
+        # 若当前点云在 world 坐标系，则先转回 body 再按 x 过滤
+        if self.coord_frame == 'world':
+            world_to_body = self._get_world_to_body_transform(frame) if frame is not None else None
+            if world_to_body is not None:
+                R = world_to_body[:3, :3]
+                t = world_to_body[:3, 3]
+                pts_body = (R @ pts.T).T + t
+                return pts_body[:, 0] <= self.gt_max_x
+
+        # body 坐标系（或无法转换时）直接按当前 x 过滤
+        return pts[:, 0] <= self.gt_max_x
 
     def _refine_center_for_tangent(self, points, center, radius, camera_pos, max_iters=4):
         """
@@ -289,12 +367,13 @@ class TrajectoryVisualizer:
 
         return geoms
 
-    def filter_point_cloud_by_x(self, pcd):
+    def filter_point_cloud_by_x(self, pcd, frame=None):
         """
-        根据x阈值过滤点云（保留 x <= 阈值 的点）
+        根据x阈值过滤点云（始终按 body 坐标系过滤，保留 body_x <= 阈值 的点）
 
         Args:
             pcd: Open3D点云对象
+            frame: 当前帧（当当前坐标系为world时用于 world->body 变换）
 
         Returns:
             过滤后的Open3D点云对象
@@ -306,7 +385,20 @@ class TrajectoryVisualizer:
         if points.size == 0:
             return pcd
 
-        mask = points[:, 0] <= self.x_filter_threshold
+        # 始终按 body 坐标系 x 做过滤
+        if self.coord_frame == 'world':
+            world_to_body = self._get_world_to_body_transform(frame) if frame is not None else None
+            if world_to_body is not None:
+                R = world_to_body[:3, :3]
+                t = world_to_body[:3, 3]
+                points_body = (R @ points.T).T + t
+                mask = points_body[:, 0] <= self.x_filter_threshold
+            else:
+                # 无法转换时兜底：按当前点云x过滤
+                mask = points[:, 0] <= self.x_filter_threshold
+        else:
+            mask = points[:, 0] <= self.x_filter_threshold
+
         return pcd.select_by_index(np.where(mask)[0])
 
     
@@ -431,7 +523,7 @@ class TrajectoryVisualizer:
                 'total_points': 0
             }
 
-        gt_mask = points_all[:, 0] <= self.gt_max_x
+        gt_mask = self._build_gt_body_x_mask(points_all, frame=frame)
         gt_indices = np.where(gt_mask)[0]
         if gt_indices.size < 8:
             return {
@@ -638,7 +730,7 @@ class TrajectoryVisualizer:
                     if pcd is not None:
                         points_all = np.asarray(pcd.points)
                         if points_all.shape[0] > 0:
-                            gt_mask = points_all[:, 0] <= self.gt_max_x
+                            gt_mask = self._build_gt_body_x_mask(points_all, frame=frame)
                             gt_indices = np.where(gt_mask)[0]
                             pcd_for_gt = pcd.select_by_index(gt_indices) if gt_indices.size > 0 else pcd
                         else:
@@ -723,10 +815,21 @@ class TrajectoryVisualizer:
                 skipped_no_gt += 1
                 continue
 
-            gt_list = np.asarray(gt_pos, dtype=np.float64).tolist()
+            gt_pos_data_frame = self._convert_point_between_frames(
+                gt_pos,
+                source_frame=self.coord_frame,
+                target_frame=self.data_coord_frame,
+                frame=frame
+            )
+            if gt_pos_data_frame is None:
+                skipped_no_gt += 1
+                continue
+
+            gt_list = np.asarray(gt_pos_data_frame, dtype=np.float64).tolist()
 
             frame['gt_pos'] = gt_list
             frame['gt_pos_source'] = 'gt_fit_icp'
+            frame['gt_pos_frame'] = self.data_coord_frame
             if gt_result.get('rmse') is not None:
                 frame['gt_pos_rmse'] = float(gt_result['rmse'])
             updated += 1
@@ -1029,7 +1132,7 @@ class TrajectoryVisualizer:
         pcd = self.create_point_cloud_from_depth(rgb_image, depth_array, frame=frame)
 
         # 可选过滤：剔除 x > 阈值 的点
-        pcd = self.filter_point_cloud_by_x(pcd)
+        pcd = self.filter_point_cloud_by_x(pcd, frame=frame)
 
         # 估计ground truth球心（基于拟合，不使用点云质心）
         gt_result = self.get_or_compute_gt_result(frame_idx, frame=frame, pcd=pcd)
@@ -1328,7 +1431,7 @@ class TrajectoryVisualizer:
         def key_toggle_x_filter(vis):
             self.enable_x_filter = not self.enable_x_filter
             status = "ON" if self.enable_x_filter else "OFF"
-            print(f"\n[X过滤] 状态: {status} (阈值: x <= {self.x_filter_threshold:.2f}m)")
+            print(f"\n[X过滤] 状态: {status} (阈值: body_x <= {self.x_filter_threshold:.2f}m)")
             controller.should_update = True
             return False
 
@@ -1416,7 +1519,7 @@ class TrajectoryVisualizer:
                         pcd = self.create_point_cloud_from_depth(rgb_image, depth_array, frame=frame)
 
                         # 可选过滤：剔除 x > 阈值 的点
-                        pcd = self.filter_point_cloud_by_x(pcd)
+                        pcd = self.filter_point_cloud_by_x(pcd, frame=frame)
 
                         # 估计ground truth球心（基于拟合，不使用点云质心）
                         gt_result = self.get_or_compute_gt_result(frame_idx, frame=frame, pcd=pcd)
@@ -1572,7 +1675,7 @@ class TrajectoryVisualizer:
                         print(f"帧索引:   {frame.get('frame_index', frame_idx)}")
                         print(f"RGB文件:   {rgb_path}")
                         print(f"Depth文件: {depth_path}")
-                        print(f"X过滤: {'ON' if self.enable_x_filter else 'OFF'} (x <= {self.x_filter_threshold:.2f}m)")
+                        print(f"X过滤: {'ON' if self.enable_x_filter else 'OFF'} (body_x <= {self.x_filter_threshold:.2f}m)")
                         print(f"Detection球显示: {'ON' if self.show_detection_sphere else 'OFF'}")
                         print(f"KF球显示: {'ON' if self.show_kf_sphere else 'OFF'}")
                         print(f"GT球显示: {'ON' if self.show_ground_truth_marker else 'OFF'}")

@@ -174,6 +174,7 @@ class BallTrackingNode(Node):
 
         self.num_balls = int(runtime_cfg.get('num_balls', tracker_config.get('num_balls', 1)))
         self.dt = float(runtime_cfg.get('dt', tracker_config.get('dt', 1.0 / 60.0)))
+        self.dt_dynamic = None
         self.ball_tracker = BallTracker(tracker_config=tracker_config)
         self.center_border_pixels = int(detector_cfg.get('center_border_pixels', tracker_config.get('center_border_pixels', 50)))
         self.center_method = detector_cfg.get('center_method', tracker_config.get('center_method', 'min_depth'))
@@ -451,7 +452,7 @@ class BallTrackingNode(Node):
         else:
             dt_dynamic = self.dt
         self.prev_predict_time_sec = predict_time_sec
-        
+        self.dt_dynamic = dt_dynamic
         print(f"Predict time: {dt_dynamic}")
 
         # 检查数据是否就绪
@@ -878,7 +879,7 @@ class BallTrackingNode(Node):
             'tracker_id': tracker_id,
             'start_timestamp': self.trajectory_start_time[tracker_id],
             'frame_count': len(self.trajectory_data[tracker_id]),
-            'dt': self.dt,
+            'dt': self.dt_dynamic if self.dt_dynamic is not None else self.dt,
             'ground_z_threshold': self.ground_z_threshold,
             'coord_frame': self.trajectory_coord_frame,
             'image_dir': traj_name,
