@@ -91,6 +91,7 @@ def _load_detection_series(json_path: Path):
 	contour_areas = []
 	online_det_fit_pos = []
 	online_det_fit_vel = []
+	base_positions = []
 	for fr in frames:
 		body_pos = _safe_vec3(fr.get("body_pos", None))
 		body_rot = _safe_rot3x3(fr.get("body_rot", None))
@@ -119,6 +120,11 @@ def _load_detection_series(json_path: Path):
 				times.append(float(ts) - float(start_ts))
 			else:
 				times.append(float(fid) * dt)
+
+		if body_pos is not None:
+			base_positions.append(np.asarray(body_pos, dtype=float))
+		else:
+			base_positions.append(np.asarray([np.nan, np.nan, np.nan], dtype=float))
 
 		contour_areas.append(float(fr.get("contour_area")) if fr.get("contour_area", None) is not None else np.nan)
 
@@ -197,7 +203,48 @@ def _load_detection_series(json_path: Path):
 		contour_areas,
 		online_det_fit_pos,
 		online_det_fit_vel,
+		base_positions,
 	)
+
+
+def _plot_base_pos_vs_time(
+	json_path: Path,
+	output_dir: Path,
+	times: np.ndarray,
+	base_pos: np.ndarray,
+	show: bool,
+):
+	"""单独绘制 base_pos 的 X/Y/Z 随时间曲线（与当前 times 严格对齐）。"""
+	if base_pos.size == 0 or not np.isfinite(base_pos).any():
+		print(f"[跳过] {json_path.name}: 没有可用的 base_pos")
+		return
+
+	fig, axes = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
+	labels = ["base_x", "base_y", "base_z"]
+	colors = ["tab:blue", "tab:orange", "tab:green"]
+
+	for i in range(3):
+		valid = np.isfinite(times) & np.isfinite(base_pos[:, i])
+		if np.any(valid):
+			axes[i].plot(times[valid], base_pos[valid, i], color=colors[i], linewidth=1.8, label=labels[i])
+			axes[i].scatter(times[valid], base_pos[valid, i], color=colors[i], s=14, alpha=0.9)
+		axes[i].set_ylabel(labels[i])
+		axes[i].grid(True, alpha=0.3)
+		axes[i].legend(loc="best")
+
+	axes[-1].set_xlabel("t (s)")
+	fig.suptitle(f"Figure0 | {json_path.stem} | base_pos (timestamp aligned)")
+	fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+	output_dir.mkdir(parents=True, exist_ok=True)
+	out_path = output_dir / f"{json_path.stem}_figure0_base_pos_vs_t.png"
+	fig.savefig(out_path, dpi=160)
+	print(f"[已保存] {out_path}")
+
+	if show:
+		plt.show()
+
+	plt.close(fig)
 
 
 def _set_equal_aspect_3d(ax, pts: np.ndarray):
@@ -412,7 +459,7 @@ def _collect_global_error_stats(json_files: list[Path], fit_method: str, fit_sou
 	global_err_down = {"x": [], "y": [], "z": [], "vx": [], "vy": [], "vz": []}
 
 	for js in json_files:
-		points, gt_points, _, times, kf_update_pos, kf_update_vel, _, _, _, _, _, _, _ = _load_detection_series(js)
+		points, gt_points, _, times, kf_update_pos, kf_update_vel, _, _, _, _, _, _, _, _ = _load_detection_series(js)
 		if not points:
 			continue
 		det_pts = np.asarray(points, dtype=float)
@@ -451,7 +498,7 @@ def _collect_global_online_det_vs_gt_fit_stats(json_files: list[Path], fit_metho
 	global_err_down = {"x": [], "y": [], "z": [], "vx": [], "vy": [], "vz": []}
 
 	for js in json_files:
-		points, gt_points, _, times, _, _, _, _, _, _, _, online_det_fit_pos, online_det_fit_vel = _load_detection_series(js)
+		points, gt_points, _, times, _, _, _, _, _, _, _, online_det_fit_pos, online_det_fit_vel, _ = _load_detection_series(js)
 		if not points:
 			continue
 
@@ -1103,6 +1150,7 @@ def _plot_one_trajectory(json_path: Path, output_dir: Path, fit_method: str, fit
 		contour_areas,
 		online_det_fit_pos,
 		online_det_fit_vel,
+		base_positions,
 	) = _load_detection_series(json_path)
 
 	if not points:
@@ -1122,8 +1170,18 @@ def _plot_one_trajectory(json_path: Path, output_dir: Path, fit_method: str, fit
 	fit_gt_pts, fit_gt_vel, fit_gt_coef = _compute_fit_points_and_velocity(ts, gt_pts, fit_method)
 	online_det_fit_pts = np.asarray(online_det_fit_pos, dtype=float)
 	online_det_fit_vel = np.asarray(online_det_fit_vel, dtype=float)
+	base_pos = np.asarray(base_positions, dtype=float)
 	if not np.isfinite(online_det_fit_pts).any() or not np.isfinite(online_det_fit_vel).any():
 		online_det_fit_pts, online_det_fit_vel = _compute_online_fit_points_and_velocity(ts, det_pts, fit_method)
+
+	# 0) 单独绘制 base_pos（时间戳与当前序列严格对齐）
+	_plot_base_pos_vs_time(
+		json_path,
+		output_dir=output_dir,
+		times=ts,
+		base_pos=base_pos,
+		show=show,
+	)
 
 	use_gt = fit_source == "gt" and np.isfinite(fit_gt_pts).any()
 	selected_source = "gt" if use_gt else "detection"
