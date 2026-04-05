@@ -148,13 +148,13 @@ tracker:
     # 卡尔曼滤波过程噪声（提高值会降低对预测的信任）
     process_noise: [0.0002, 0.0001, 0.0002]
     # 卡尔曼滤波观测噪声（降低值会提高对观测的信任）
-    measurement_noise: [0.030, 0.022, 0.030]
+    measurement_noise: [0.0030, 0.0022, 0.0030]
     # 空气阻力系数（典型值0.1-1.0）
     drag_coefficient: 0.0
     # ===== KalmanFilter3D 鲁棒更新参数（soft/hard gating） =====
-    enable_axiswise_outlier_rejection: true
-    axis_soft_gate_threshold: [0.5, 0.5, 0.5]
-    axis_hard_gate_threshold: [5.0, 5.0, 5.0]
+    enable_axiswise_outlier_rejection: false
+    axis_soft_gate_threshold: [2.0, 2.0, 2.0]
+    axis_hard_gate_threshold: [3.5, 3.5, 3.5]
     axis_abs_residual_threshold: null #[0.03, 0.02, 0.05]
     min_soft_weight: 0.05
     rejection_cov_inflation: [2, 2, 4]

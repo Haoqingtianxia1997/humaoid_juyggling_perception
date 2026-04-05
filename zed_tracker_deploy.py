@@ -114,6 +114,7 @@ class BallTrackingNode(Node):
         self.latest_rgb = None
         self.latest_depth = None
         self.latest_image_timestamp = None  # 保存图像时间戳（用于marker时间同步）
+        self.prev_predict_time_sec = None   # 上一帧预测时刻（秒，用于动态dt）
         self.latest_cam_pos = np.array([0.0, 0.0, 0.0])  # 相机世界位置（用于marker可视化）
         self.latest_cam_rot = np.eye(3)  # 相机旋转矩阵
         self.latest_base_pos = np.array([0.0, 0.0, 0.0])  # 机器人本体位置（用于坐标转换）
@@ -347,7 +348,6 @@ class BallTrackingNode(Node):
         self.latest_rgb = cv_image_masked
         self.latest_depth = cv_depth
         self.latest_image_timestamp = rgb_msg.header.stamp  # 保存时间戳用于marker同步
-        
         # 直接在图像回调中处理追踪（确保处理与图像同步）
         self.process_tracking()
         
@@ -433,6 +433,27 @@ class BallTrackingNode(Node):
     
         import time 
         start_time = time.perf_counter()
+        current_time = time.time()
+
+        # 预测步长优先使用前后两帧时间差；无有效时间差时回退固定 dt
+        predict_time_sec = None
+        if self.latest_image_timestamp is not None:
+            stamp = self.latest_image_timestamp
+            if hasattr(stamp, 'sec') and hasattr(stamp, 'nanosec'):
+                predict_time_sec = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        if predict_time_sec is None:
+            predict_time_sec = current_time
+
+        if self.prev_predict_time_sec is not None:
+            dt_dynamic = predict_time_sec - self.prev_predict_time_sec
+            if not (np.isfinite(dt_dynamic) and dt_dynamic > 0.0):
+                dt_dynamic = self.dt
+        else:
+            dt_dynamic = self.dt
+        self.prev_predict_time_sec = predict_time_sec
+        
+        print(f"Predict time: {dt_dynamic}")
+
         # 检查数据是否就绪
         if self.latest_rgb is None or self.latest_depth is None:
             print("Waiting for RGB and Depth data...")
@@ -467,7 +488,10 @@ class BallTrackingNode(Node):
         
         # === 预测步骤（每帧都执行） ===
         if any(self.ball_tracker.is_validated(i) for i in range(self.num_balls)):
-            self.ball_tracker.predict_all(ground_z_threshold=self.ground_z_threshold)
+            self.ball_tracker.predict_all(
+                ground_z_threshold=self.ground_z_threshold,
+                dt=dt_dynamic,
+            )
         
         # === 保存已经落地的轨迹（在清理之前） ===
         if self.enable_trajectory_recording:
@@ -555,7 +579,8 @@ class BallTrackingNode(Node):
                 base_rot,
                 base_pos,
                 rgb_bgr,
-                depth_array
+                depth_array,
+                current_time
             )
             
         # === 从 kf_obs_body 提取 catch_info ===
@@ -610,7 +635,7 @@ class BallTrackingNode(Node):
             self.get_logger().info(f"Tracking FPS: {fps:.1f}")
             self.last_process_time = current_time
     
-    def record_trajectory_frame(self, has_detection, actually_updated, detection_results, detection_assignments, base_rot, base_pos, rgb_image, depth_image):
+    def record_trajectory_frame(self, has_detection, actually_updated, detection_results, detection_assignments, base_rot, base_pos, rgb_image, depth_image, current_time):
         """
         记录当前帧的轨迹数据，包括RGB和depth图像
         
@@ -623,10 +648,8 @@ class BallTrackingNode(Node):
             base_pos: 基座位置
             rgb_image: RGB图像（BGR格式）
             depth_image: 深度图像
+            current_time: 当前时间
         """
-        import json
-        
-        current_time = time.time()
         
         # 为每个tracker记录数据
         for tracker_id in range(self.num_balls):

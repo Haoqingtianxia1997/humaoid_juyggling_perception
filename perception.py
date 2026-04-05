@@ -1288,13 +1288,29 @@ class KalmanFilter3D:
         hard = self.axis_hard_gate_threshold
 
         for i in range(3):
-            if nu[i] <= soft[i]:
-                weights[i] = 1.0
-            elif nu[i] <= hard[i]:
-                # 软衰减：越离谱，权重越小
-                weights[i] = max((soft[i] / max(nu[i], 1e-12)) ** 2, self.min_soft_weight)
-            else:
+           
+           
+            # if nu[i] <= soft[i]:
+            #     weights[i] = 1.0
+            # elif nu[i] <= hard[i]:
+            #     # 软衰减：越离谱，权重越小
+            #     weights[i] = max((soft[i] / max(nu[i], 1e-12)) ** 2, self.min_soft_weight)
+            # else:
+            #     weights[i] = 0.0
+           
+           
+            nu_i = float(max(nu[i], 0.0))
+            soft_i = float(max(soft[i], 1e-12))
+            hard_i = float(max(hard[i], soft_i))
+
+            if nu_i > hard_i:
+                # 超过硬门限：拒绝
                 weights[i] = 0.0
+            else:
+                # 在可接受区间内采用连续衰减：
+                # nu 越小，weight 越接近 1；nu 越大，weight 越小
+                w = np.exp(-0.5 * (nu_i / soft_i) ** 2)
+                weights[i] = float(np.clip(w, self.min_soft_weight, 1.0))
 
         # 绝对残差硬拒绝
         if self.axis_abs_residual_threshold is not None:
@@ -1443,10 +1459,10 @@ class KalmanFilter3D:
 
         R_diag = np.diag(self.R).astype(float)
         R_eff_diag = []
-
+        alpha = 10
         for idx in accepted_indices:
             # 权重越小，等效测量噪声越大，表示“少信一点”
-            R_eff_diag.append(R_diag[idx] / max(weights[idx], 1e-12))
+            R_eff_diag.append(R_diag[idx] * alpha / max(weights[idx], 1e-12))
 
         R_eff = np.diag(R_eff_diag)
         S_sel = H_sel @ self.P @ H_sel.T + R_eff
@@ -1551,7 +1567,7 @@ class KalmanFilter3D:
             return None, None
 
         # 数值积分预测落地
-        dt_sim = min(self.dt, 0.002)
+        dt_sim = self.dt
         max_steps = 20000
 
         sim_pos = pos.copy()
@@ -2046,15 +2062,28 @@ class BallTracker:
         self.detected_trajectories = [[] for _ in range(num_balls)]  # 检测轨迹
         self.max_trajectory_length = 1000  # 最大轨迹长度
         
-    def predict_all(self, ground_z_threshold=0.15):
+    def predict_all(self, ground_z_threshold=0.15, dt=None):
         """
         对所有激活的滤波器执行预测步骤，并检测落地
         
         Args:
             ground_z_threshold: 地面高度阈值（米），低于此高度认为球已落地
+            dt: 可选的动态时间步长（秒）。
+                - 若为有效正数，则本次预测使用该 dt
+                - 否则回退到各追踪器内部配置的固定 dt
         """
         start_time = time.perf_counter() if self.verbose else None
         active_count = 0
+
+        # 动态 dt：仅当是有效正数时启用
+        use_dynamic_dt = False
+        dt_value = None
+        if dt is not None:
+            try:
+                dt_value = float(dt)
+                use_dynamic_dt = np.isfinite(dt_value) and dt_value > 0.0
+            except Exception:
+                use_dynamic_dt = False
         
         for tracker_id in range(self.num_balls):
             # 跳过已落地或未初始化的追踪器
@@ -2062,6 +2091,8 @@ class BallTracker:
                 continue
             
             active_count += 1
+            if use_dynamic_dt:
+                self.kf_filters[tracker_id].dt = dt_value
             # 正常预测
             self.kf_filters[tracker_id].predict()
             

@@ -110,6 +110,33 @@ def _kinematic_predict_from_state(pos: np.ndarray, vel: np.ndarray, dt: float, g
     return out_p, out_v
 
 
+def _timestamp_to_sec(ts):
+    """将 frame['timestamp'] 统一解析为秒（float）；无法解析时返回 None。"""
+    if ts is None:
+        return None
+
+    if isinstance(ts, (int, float, np.integer, np.floating)):
+        v = float(ts)
+        return v if np.isfinite(v) else None
+
+    if isinstance(ts, dict):
+        sec = ts.get("sec", None)
+        nsec = ts.get("nanosec", ts.get("nsec", None))
+        try:
+            if sec is not None and nsec is not None:
+                v = float(sec) + float(nsec) * 1e-9
+                return v if np.isfinite(v) else None
+        except Exception:
+            return None
+
+    # 兼容字符串数字
+    try:
+        v = float(ts)
+        return v if np.isfinite(v) else None
+    except Exception:
+        return None
+
+
 def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_n: int):
     with open(json_path, "r", encoding="utf-8") as f:
         traj = json.load(f)
@@ -158,11 +185,28 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
     kalman_cfg = tracker_params.get("kalman", {})
     g_abs = float(abs(kalman_cfg.get("g", tracker_params.get("g", 9.81))))
     dt_default = float(runtime_cfg.get("dt", tracker_params.get("dt", 1.0 / 60.0)))
-    t0_abs = float(frames[0].get("timestamp", 0.0)) if len(frames) > 0 and frames[0].get("timestamp", None) is not None else 0.0
+
+    # 预计算每帧绝对时间与逐帧 dt：
+    # - 优先使用数据中的前后帧时间戳差
+    # - 无法计算时回退固定 dt_default（保险）
+    frame_time_sec = [_timestamp_to_sec(fr.get("timestamp", None)) for fr in frames]
+    dt_to_prev = [dt_default] * len(frames)
+    for i in range(1, len(frames)):
+        t_prev = frame_time_sec[i - 1]
+        t_curr_abs = frame_time_sec[i]
+        if t_prev is not None and t_curr_abs is not None:
+            dt_i = float(t_curr_abs) - float(t_prev)
+            if np.isfinite(dt_i) and dt_i > 0.0:
+                dt_to_prev[i] = dt_i
+
+    # 用 dt_to_prev 累积得到单调时间轴（用于 OLS 与缺测外推）
+    t_rel = [0.0] * len(frames)
+    for i in range(1, len(frames)):
+        t_rel[i] = t_rel[i - 1] + float(dt_to_prev[i])
 
     for i, fr in enumerate(frames):
-        ts_abs = fr.get("timestamp", None)
-        t_curr = float(ts_abs) - t0_abs if ts_abs is not None else float(i) * dt_default
+        t_curr = float(t_rel[i])
+        dt_curr = float(dt_to_prev[i]) if i < len(dt_to_prev) else dt_default
 
         det_raw = fr.get("detection_pos", None)
         det = None
@@ -180,7 +224,7 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
 
         # 1) predict（仅对已验证tracker）
         if tracker.is_validated(0):
-            tracker.predict_all(ground_z_threshold=ground_z_threshold)
+            tracker.predict_all(ground_z_threshold=ground_z_threshold, dt=dt_curr)
 
         # 2) cleanup grounded
         tracker.cleanup_grounded_balls(kf_obs, kf_obs_body)
@@ -255,7 +299,15 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
         #    当 predict_n<=0（例如配置 enable_predict_n=false）时，不生成 future 轨迹
         if int(predict_n) > 0 and tracker.kf_filters[0].initialized:
             future_kf = copy.deepcopy(tracker.kf_filters[0])
-            for _ in range(max(0, int(predict_n))):
+            for step in range(1, max(0, int(predict_n)) + 1):
+                idx = i + step
+                if 0 <= idx < len(dt_to_prev):
+                    dt_step = float(dt_to_prev[idx])
+                else:
+                    dt_step = dt_default
+                if not (np.isfinite(dt_step) and dt_step > 0.0):
+                    dt_step = dt_default
+                future_kf.dt = dt_step
                 future_kf.predict()
             f_pos, f_vel = _state_or_none(future_kf.get_state())
             tgt_idx = i + max(0, int(predict_n))
