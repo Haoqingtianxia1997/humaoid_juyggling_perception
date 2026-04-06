@@ -1,0 +1,24 @@
+# Core scientific stack
+numpy
+scipy
+matplotlib
+
+# Computer vision / geometry
+opencv-python
+open3d
+
+# Simulation
+mujoco
+
+# Config parsing
+PyYAML
+
+# Notes (ROS2-provided, not installed via pip here):
+# rclpy
+# sensor_msgs
+# geometry_msgs
+# std_msgs
+# visualization_msgs
+# tf2_ros
+# cv_bridge
+# message_filters

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import yaml
 from scipy.optimize import least_squares
 
 
@@ -65,6 +66,33 @@ def _to_world_var_diag(var_diag, body_rot, coord_frame):
 	return np.asarray(var_diag, dtype=float)
 
 
+def _load_online_fit_config(script_dir: Path):
+	"""从 Tracker_config.yaml 读取在线拟合配置（与 perception 默认值一致）。"""
+	cfg_path = script_dir / "Tracker_config.yaml"
+	defaults = {
+		"online_fit_max_history": 90,
+		"online_fit_xy_degree": 1,
+		"online_fit_z_degree": 2,
+	}
+	if not cfg_path.exists():
+		return defaults
+
+	try:
+		with open(cfg_path, "r", encoding="utf-8") as f:
+			cfg = yaml.safe_load(f) or {}
+		kalman_cfg = (
+			cfg.get("tracker", {})
+			.get("kalman", {})
+		)
+		return {
+			"online_fit_max_history": int(max(3, kalman_cfg.get("online_fit_max_history", defaults["online_fit_max_history"]))),
+			"online_fit_xy_degree": int(max(0, kalman_cfg.get("online_fit_xy_degree", defaults["online_fit_xy_degree"]))),
+			"online_fit_z_degree": int(max(0, kalman_cfg.get("online_fit_z_degree", defaults["online_fit_z_degree"]))),
+		}
+	except Exception:
+		return defaults
+
+
 def _load_detection_series(json_path: Path):
 	"""读取单条轨迹 detection/gt 点，返回与 KF update 对齐的序列。"""
 	with open(json_path, "r", encoding="utf-8") as f:
@@ -81,6 +109,7 @@ def _load_detection_series(json_path: Path):
 	points = []
 	gt_points = []
 	frame_ids = []
+	raw_times = []
 	times = []
 	kf_update_pos = []
 	kf_update_vel = []
@@ -113,13 +142,13 @@ def _load_detection_series(json_path: Path):
 
 		rel_t = fr.get("relative_time", None)
 		if rel_t is not None:
-			times.append(float(rel_t))
+			raw_times.append(float(rel_t))
 		else:
 			ts = fr.get("timestamp", None)
 			if ts is not None and start_ts is not None:
-				times.append(float(ts) - float(start_ts))
+				raw_times.append(float(ts) - float(start_ts))
 			else:
-				times.append(float(fid) * dt)
+				raw_times.append(float(fid) * dt)
 
 		if body_pos is not None:
 			base_positions.append(np.asarray(body_pos, dtype=float))
@@ -188,6 +217,30 @@ def _load_detection_series(json_path: Path):
 			kf_update_vel_var.append(np.asarray([np.nan, np.nan, np.nan], dtype=float))
 			normalized_innovation.append(np.asarray([np.nan, np.nan, np.nan], dtype=float))
 			innovation_mahalanobis2.append(np.nan)
+
+	# 时间轴优先使用每一帧时间戳（relative_time / timestamp），仅在缺失时回退 dt
+	dt_fallback = float(dt) if (np.isfinite(dt) and dt > 0.0) else (1.0 / 60.0)
+	if len(raw_times) > 0:
+		first_valid = None
+		for tr in raw_times:
+			if np.isfinite(tr):
+				first_valid = float(tr)
+				break
+		if first_valid is None:
+			first_valid = 0.0
+
+		last_t = 0.0
+		for i, tr in enumerate(raw_times):
+			if np.isfinite(tr):
+				ti = float(tr) - float(first_valid)
+				# 防止时间倒退：若异常则用上一帧 + dt_fallback
+				if i > 0 and ti <= last_t:
+					ti = last_t + dt_fallback
+			else:
+				ti = 0.0 if i == 0 else (last_t + dt_fallback)
+
+			times.append(float(ti))
+			last_t = float(ti)
 
 	return (
 		points,
@@ -408,11 +461,46 @@ def _compute_fit_points_and_velocity(times: np.ndarray, pts: np.ndarray, fit_met
 	return fit_pts, fit_vel, fit_coef
 
 
-def _compute_online_fit_points_and_velocity(times: np.ndarray, pts: np.ndarray, fit_method: str):
-	"""在线拟合：第 n 时刻仅使用 [0..n] 的点做拟合，并在 t_n 处读出位置/速度。"""
+def _fit_axis_online_ols(times: np.ndarray, values: np.ndarray, degree: int):
+	"""与 perception.py 一致的在线前缀 OLS。"""
+	t = np.asarray(times, dtype=float).reshape(-1)
+	y = np.asarray(values, dtype=float).reshape(-1)
+	valid = np.isfinite(t) & np.isfinite(y)
+	t = t[valid]
+	y = y[valid]
+	if t.size == 0:
+		return None
+	deg = int(max(0, degree))
+	need = deg + 1
+	if deg >= 1 and t.size >= need and np.ptp(t) > 1e-12:
+		return np.polyfit(t, y, deg)
+	return np.asarray([float(y[-1])], dtype=float)
+
+
+def _poly_eval_and_derivative(coef: list[float] | np.ndarray, t: float):
+	c = np.asarray(coef, dtype=float).reshape(-1)
+	pos = float(np.polyval(c, t))
+	if c.size <= 1:
+		vel = 0.0
+	else:
+		vel = float(np.polyval(np.polyder(c), t))
+	return pos, vel
+
+
+def _compute_online_fit_points_and_velocity(
+	times: np.ndarray,
+	pts: np.ndarray,
+	fit_method: str,
+	online_fit_max_history: int = 90,
+	online_fit_xy_degree: int = 1,
+	online_fit_z_degree: int = 2,
+):
+	"""在线拟合：OLS 时与 perception 一致；其他方法保留前缀拟合。"""
 	n = len(times)
 	fit_pts = np.full_like(pts, np.nan, dtype=float)
 	fit_vel = np.full((n, 3), np.nan, dtype=float)
+	hist = int(max(3, online_fit_max_history))
+	method = str(fit_method).strip().lower()
 
 	for k in range(n):
 		tk = float(times[k])
@@ -421,14 +509,31 @@ def _compute_online_fit_points_and_velocity(times: np.ndarray, pts: np.ndarray, 
 			tv = times[: k + 1][valid_prefix]
 			yv = pts[: k + 1, i][valid_prefix]
 
-			degree = 1 if key in ("x", "y") else 2
-			min_samples = degree + 1
-			if len(tv) < min_samples or np.ptp(tv) <= 1e-12:
+			if len(tv) == 0:
+				continue
+			if len(tv) > hist:
+				tv = tv[-hist:]
+				yv = yv[-hist:]
+
+			degree = int(online_fit_xy_degree) if key in ("x", "y") else int(online_fit_z_degree)
+
+			if method == "ols":
+				# 与 perception.py 完全一致的 OLS 逻辑
+				coef = _fit_axis_online_ols(tv, yv, degree=degree)
+			else:
+				# 保留 ransac/huber 的在线前缀拟合能力
+				need = degree + 1
+				if degree >= 1 and len(tv) >= need and np.ptp(tv) > 1e-12:
+					coef = _fit_poly(tv, yv, degree=degree, method=method)
+				else:
+					coef = np.asarray([float(yv[-1])], dtype=float)
+
+			if coef is None:
 				continue
 
-			coef = _fit_poly(tv, yv, degree=degree, method=fit_method)
-			fit_pts[k, i] = float(np.polyval(coef, tk))
-			fit_vel[k, i] = float(_eval_poly_velocity(coef, np.asarray([tk], dtype=float))[0])
+			p, v = _poly_eval_and_derivative(coef, tk)
+			fit_pts[k, i] = p
+			fit_vel[k, i] = v
 
 	return fit_pts, fit_vel
 
@@ -492,10 +597,15 @@ def _collect_global_error_stats(json_files: list[Path], fit_method: str, fit_sou
 	return global_err, global_err_down
 
 
-def _collect_global_online_det_vs_gt_fit_stats(json_files: list[Path], fit_method: str):
+def _collect_global_online_det_vs_gt_fit_stats(json_files: list[Path], fit_method: str, online_fit_cfg: dict | None = None):
 	"""汇总 online detection fit 与 gt fit 的误差统计。"""
 	global_err = {"x": [], "y": [], "z": [], "vx": [], "vy": [], "vz": []}
 	global_err_down = {"x": [], "y": [], "z": [], "vx": [], "vy": [], "vz": []}
+	cfg = online_fit_cfg or {
+		"online_fit_max_history": 90,
+		"online_fit_xy_degree": 1,
+		"online_fit_z_degree": 2,
+	}
 
 	for js in json_files:
 		points, gt_points, _, times, _, _, _, _, _, _, _, online_det_fit_pos, online_det_fit_vel, _ = _load_detection_series(js)
@@ -509,7 +619,14 @@ def _collect_global_online_det_vs_gt_fit_stats(json_files: list[Path], fit_metho
 		online_det_fit_pts = np.asarray(online_det_fit_pos, dtype=float)
 		online_det_fit_vel = np.asarray(online_det_fit_vel, dtype=float)
 		if not np.isfinite(online_det_fit_pts).any() or not np.isfinite(online_det_fit_vel).any():
-			online_det_fit_pts, online_det_fit_vel = _compute_online_fit_points_and_velocity(ts, det_pts, fit_method)
+			online_det_fit_pts, online_det_fit_vel = _compute_online_fit_points_and_velocity(
+				ts,
+				det_pts,
+				fit_method,
+				online_fit_max_history=cfg.get("online_fit_max_history", 90),
+				online_fit_xy_degree=cfg.get("online_fit_xy_degree", 1),
+				online_fit_z_degree=cfg.get("online_fit_z_degree", 2),
+			)
 		fit_gt_pts, fit_gt_vel, _ = _compute_fit_points_and_velocity(ts, gt_pts, fit_method)
 
 		err_bundle = _build_err_bundle(online_det_fit_pts, online_det_fit_vel, fit_gt_pts, fit_gt_vel)
@@ -1135,7 +1252,14 @@ def _plot_kf_variance_vs_time(
 	plt.close(fig)
 
 
-def _plot_one_trajectory(json_path: Path, output_dir: Path, fit_method: str, fit_source: str, show: bool = True):
+def _plot_one_trajectory(
+	json_path: Path,
+	output_dir: Path,
+	fit_method: str,
+	fit_source: str,
+	online_fit_cfg: dict | None = None,
+	show: bool = True,
+):
 	(
 		points,
 		gt_points,
@@ -1171,8 +1295,20 @@ def _plot_one_trajectory(json_path: Path, output_dir: Path, fit_method: str, fit
 	online_det_fit_pts = np.asarray(online_det_fit_pos, dtype=float)
 	online_det_fit_vel = np.asarray(online_det_fit_vel, dtype=float)
 	base_pos = np.asarray(base_positions, dtype=float)
+	cfg = online_fit_cfg or {
+		"online_fit_max_history": 90,
+		"online_fit_xy_degree": 1,
+		"online_fit_z_degree": 2,
+	}
 	if not np.isfinite(online_det_fit_pts).any() or not np.isfinite(online_det_fit_vel).any():
-		online_det_fit_pts, online_det_fit_vel = _compute_online_fit_points_and_velocity(ts, det_pts, fit_method)
+		online_det_fit_pts, online_det_fit_vel = _compute_online_fit_points_and_velocity(
+			ts,
+			det_pts,
+			fit_method,
+			online_fit_max_history=cfg.get("online_fit_max_history", 90),
+			online_fit_xy_degree=cfg.get("online_fit_xy_degree", 1),
+			online_fit_z_degree=cfg.get("online_fit_z_degree", 2),
+		)
 
 	# 0) 单独绘制 base_pos（时间戳与当前序列严格对齐）
 	_plot_base_pos_vs_time(
@@ -1436,6 +1572,14 @@ def main():
 		return
 
 	print(f"共找到 {len(json_files)} 条轨迹。先打印全局汇总，再逐条绘制。", flush=True)
+	online_fit_cfg = _load_online_fit_config(script_dir)
+	print(
+		"online fit cfg "
+		f"(from Tracker_config.yaml): max_history={online_fit_cfg['online_fit_max_history']}, "
+		f"xy_degree={online_fit_cfg['online_fit_xy_degree']}, "
+		f"z_degree={online_fit_cfg['online_fit_z_degree']}",
+		flush=True,
+	)
 	# 先计算并打印全局统计，再逐条出图
 	global_err, global_err_down = _collect_global_error_stats(json_files, args.fit_method, "gt")
 	_print_global_error_stats(
@@ -1447,7 +1591,9 @@ def main():
 		title="所有轨迹汇总误差统计（kf_update - gt_fit，仅下降段 vz<=0）",
 	)
 	global_online_gt_err, global_online_gt_err_down = _collect_global_online_det_vs_gt_fit_stats(
-		json_files, args.fit_method
+		json_files,
+		args.fit_method,
+		online_fit_cfg=online_fit_cfg,
 	)
 	_print_global_error_stats(
 		global_online_gt_err,
@@ -1465,6 +1611,7 @@ def main():
 			output_dir=output_dir,
 			fit_method=args.fit_method,
 			fit_source=args.fit_source,
+			online_fit_cfg=online_fit_cfg,
 			show=not args.no_show,
 		)
 

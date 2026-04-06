@@ -118,6 +118,9 @@ tracker:
     ground_z_threshold: -0.22
     # 速度不确定性最大值 (m/s)
     max_velocity_uncertainty: 0.5
+    # 使用机器人数据
+    use_robot_data: true
+
 
   # 数据关联参数（BallTracker._match_detections）
   association:
@@ -144,7 +147,7 @@ tracker:
   # KalmanFilter3D 参数
   kalman:
     # 重力加速度 (m/s²)
-    g: 9.81
+    g: 9.8
     # 卡尔曼滤波过程噪声（提高值会降低对预测的信任）
     process_noise: [0.0002, 0.0001, 0.0002]
     # 卡尔曼滤波观测噪声（降低值会提高对观测的信任）
@@ -171,11 +174,11 @@ tracker:
     # z 方向多项式阶数（推荐 2）
     online_fit_z_degree: 2
     # 默认对外状态来源："kf" / "online_fit"
-    active_state_source: "kf"
+    active_state_source: "online_fit"
     # predict source
     predict_source: "online_fit"
     # update source
-    update_source: "kf"
+    update_source: "online_fit"
 
 
   # 轨迹输出参数

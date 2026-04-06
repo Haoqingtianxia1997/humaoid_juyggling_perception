@@ -15,7 +15,6 @@ import shutil
 import time
 import yaml
 from pathlib import Path
-from robot_bridge_py.robot_client import RobotClient
 from perception import CameraIntrinsics, BallTracker, BallTrackingVisualizer
 import message_filters
 
@@ -97,19 +96,6 @@ class BallTrackingNode(Node):
         )
         
         
-        
-        
-        
-        
-        # === RobotClient（用于获取 IMU 数据）===
-        self.robot = RobotClient(
-            node=self,
-            robot_type="H1",
-            num_dof=20,
-            control_frequency=50.0,
-            interpolation_order=0.0
-        )
-        
         # === 数据存储 ===
         self.latest_rgb = None
         self.latest_depth = None
@@ -174,6 +160,7 @@ class BallTrackingNode(Node):
 
         self.num_balls = int(runtime_cfg.get('num_balls', tracker_config.get('num_balls', 1)))
         self.dt = float(runtime_cfg.get('dt', tracker_config.get('dt', 1.0 / 60.0)))
+        self.use_robot_data = bool(runtime_cfg.get('use_robot_data', tracker_config.get('use_robot_data', True)))
         self.dt_dynamic = None
         self.ball_tracker = BallTracker(tracker_config=tracker_config)
         self.center_border_pixels = int(detector_cfg.get('center_border_pixels', tracker_config.get('center_border_pixels', 50)))
@@ -261,7 +248,7 @@ class BallTrackingNode(Node):
         self.sync = message_filters.ApproximateTimeSynchronizer(
             [rgb_sub, depth_sub],
             queue_size=10,
-            slop=0.01  # 5ms 时间容差
+            slop=0.001  # 1ms 时间容差
         )
         self.sync.registerCallback(self.images_callback)
         
@@ -292,14 +279,28 @@ class BallTrackingNode(Node):
         # === 处理定时器（50Hz，与控制频率同步） ===
         # self.timer = self.create_timer(0.02, self.process_tracking)
         
+        if self.use_robot_data:
+            from robot_bridge_py.robot_client import RobotClient
+            # === RobotClient（用于获取 IMU 数据）===
+            self.robot = RobotClient(
+                node=self,
+                robot_type="H1",
+                num_dof=20,
+                control_frequency=50.0,
+                interpolation_order=0.0
+            )
+            
         # === 统计信息 ===
         self.frame_count = 0
         self.last_process_time = time.time()
-        
         self.get_logger().info("✅ Ball Tracking Node Started.")
         self.get_logger().info(f"Tracking {self.num_balls} balls at {1/self.dt:.0f}Hz")
         self.get_logger().info(f"Trajectory coordinate frame: {self.trajectory_coord_frame}")
-        self.get_logger().info("Using RobotClient for IMU data")
+        
+        if self.use_robot_data:
+            self.get_logger().info("Using RobotClient for IMU data")
+        else:
+            self.get_logger().info("Not using RobotClient for IMU data")
         # if self.enable_visualization:
         #     self.get_logger().info("Visualization enabled - Press 'q' to quit")
         
@@ -368,6 +369,8 @@ class BallTrackingNode(Node):
             quat: 四元数 [w, x, y, z]
             angular_vel: 角速度 [x, y, z]
         """
+        if not self.use_robot_data:
+            return np.array([1.0, 0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0])
         # 更新机器人状态
         self.robot.update_robot_state()
         
@@ -402,14 +405,25 @@ class BallTrackingNode(Node):
             cam_rot_rel: 相机相对于机器人本体的旋转矩阵 (3x3)
         """
         try:
-            # 从配置文件读取相机外参
-            config_path = Path(__file__).parent / 'Tracker_config.yaml'
-            with open(config_path, 'r') as f:
-                camera_config = yaml.safe_load(f)
-            extr = camera_config['extrinsics']
-            cam_pos = np.array(extr['position'])
-            cam_rot = np.array(extr['rotation'])
-            return cam_pos, cam_rot
+            if self.use_robot_data:
+                # 从配置文件读取相机外参
+                config_path = Path(__file__).parent / 'Tracker_config.yaml'
+                with open(config_path, 'r') as f:
+                    camera_config = yaml.safe_load(f)
+                extr = camera_config['extrinsics']
+                cam_pos = np.array(extr['position'])
+                cam_rot = np.array(extr['rotation'])
+                return cam_pos, cam_rot
+            else:
+                # 使用已知标定外参（相机坐标系 -> body/imu_link 坐标系）
+                cam_pos_rel = np.array([0.00, 0.00, 0.00], dtype=np.float64)
+                cam_rot_rel = np.array([
+                    [0.0,  0.0,  1.0],
+                    [-1.0, 0.0,  0.0],
+                    [0.0, -1.0,  0.0],
+                ], dtype=np.float64)
+
+                return cam_pos_rel, cam_rot_rel
             
         except Exception as e:
             self.get_logger().warn(f"Failed to get camera extrinsics: {e}")
@@ -434,7 +448,7 @@ class BallTrackingNode(Node):
     
         import time 
         start_time = time.perf_counter()
-        current_time = time.time()
+        
 
         # 预测步长优先使用前后两帧时间差；无有效时间差时回退固定 dt
         predict_time_sec = None
@@ -442,8 +456,7 @@ class BallTrackingNode(Node):
             stamp = self.latest_image_timestamp
             if hasattr(stamp, 'sec') and hasattr(stamp, 'nanosec'):
                 predict_time_sec = float(stamp.sec) + float(stamp.nanosec) * 1e-9
-        if predict_time_sec is None:
-            predict_time_sec = current_time
+                current_time = predict_time_sec
 
         if self.prev_predict_time_sec is not None:
             dt_dynamic = predict_time_sec - self.prev_predict_time_sec
