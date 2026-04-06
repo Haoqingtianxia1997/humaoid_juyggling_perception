@@ -1042,6 +1042,18 @@ class KalmanFilter3D:
         dt = kalman_cfg.get('dt', cfg_src.get('dt'))
         verbose = kalman_cfg.get('verbose', cfg_src.get('verbose'))
         g = kalman_cfg.get('g', cfg_src.get('g'))
+        enable_gravity_state_estimation = kalman_cfg.get(
+            'enable_gravity_state_estimation',
+            cfg_src.get('enable_gravity_state_estimation', False),
+        )
+        gravity_state_process_noise = kalman_cfg.get(
+            'gravity_state_process_noise',
+            cfg_src.get('gravity_state_process_noise', 0.0),
+        )
+        gravity_state_initial_std = kalman_cfg.get(
+            'gravity_state_initial_std',
+            cfg_src.get('gravity_state_initial_std', 0.5),
+        )
         process_noise = kalman_cfg.get('process_noise', cfg_src.get('process_noise'))
         measurement_noise = kalman_cfg.get('measurement_noise', cfg_src.get('measurement_noise'))
         drag_coefficient = kalman_cfg.get('drag_coefficient', cfg_src.get('drag_coefficient'))
@@ -1128,6 +1140,10 @@ class KalmanFilter3D:
 
         self.dt = dt
         self.g = g
+        self.enable_gravity_state_estimation = bool(enable_gravity_state_estimation)
+        self.gravity_state_process_noise = float(max(0.0, gravity_state_process_noise))
+        self.gravity_state_initial_std = float(max(0.0, gravity_state_initial_std))
+        self.state_dim = 7 if self.enable_gravity_state_estimation else 6
         self.drag_coefficient = drag_coefficient
         self.verbose = verbose
 
@@ -1172,35 +1188,45 @@ class KalmanFilter3D:
             self.update_source = 'kf'
         
         # 双状态：KF / 在线OLS拟合
-        self.kf_x = np.zeros(6, dtype=float)
+        self.kf_x = np.zeros(self.state_dim, dtype=float)
         self.online_fit_x = np.zeros(6, dtype=float)
 
         # 对外状态向量（由状态机选择来源）
         self.x = np.zeros(6, dtype=float)
 
         # 状态协方差矩阵
-        self.P = np.eye(6, dtype=float) * 10.0
-        self.velocity_uncertainty = np.diag(self.P)[3:]
+        self.P = np.eye(self.state_dim, dtype=float) * 10.0
+        self.velocity_uncertainty = np.diag(self.P)[3:6]
 
         # 基础状态转移矩阵（predict 时会线性化更新）
-        self.F = np.array([
-            [1, 0, 0, dt, 0, 0],
-            [0, 1, 0, 0, dt, 0],
-            [0, 0, 1, 0, 0, dt],
-            [0, 0, 0, 1, 0, 0],
-            [0, 0, 0, 0, 1, 0],
-            [0, 0, 0, 0, 0, 1]
-        ], dtype=float)
+        if self.enable_gravity_state_estimation:
+            self.F = np.eye(7, dtype=float)
+            self.F[0, 3] = dt
+            self.F[1, 4] = dt
+            self.F[2, 5] = dt
+            self.F[2, 6] = -0.5 * dt**2
+            self.F[5, 6] = -dt
+        else:
+            self.F = np.array([
+                [1, 0, 0, dt, 0, 0],
+                [0, 1, 0, 0, dt, 0],
+                [0, 0, 1, 0, 0, dt],
+                [0, 0, 0, 1, 0, 0],
+                [0, 0, 0, 0, 1, 0],
+                [0, 0, 0, 0, 0, 1]
+            ], dtype=float)
 
         # 保留变量名 B
-        self.B = np.array([0, 0, -0.5 * g * dt**2, 0, 0, -g * dt], dtype=float)
+        if self.enable_gravity_state_estimation:
+            self.B = np.array([0, 0, -0.5 * g * dt**2, 0, 0, -g * dt, 0], dtype=float)
+        else:
+            self.B = np.array([0, 0, -0.5 * g * dt**2, 0, 0, -g * dt], dtype=float)
 
         # 观测矩阵（只观测位置）
-        self.H = np.array([
-            [1, 0, 0, 0, 0, 0],  # x
-            [0, 1, 0, 0, 0, 0],  # y
-            [0, 0, 1, 0, 0, 0],  # z
-        ], dtype=float)
+        self.H = np.zeros((3, self.state_dim), dtype=float)
+        self.H[0, 0] = 1.0  # x
+        self.H[1, 1] = 1.0  # y
+        self.H[2, 2] = 1.0  # z
 
         # 过程噪声协方差 Q
         if isinstance(process_noise, (list, tuple, np.ndarray)):
@@ -1212,10 +1238,18 @@ class KalmanFilter3D:
         Q_pp = (dt**4 / 4.0) * Da
         Q_pv = (dt**3 / 2.0) * Da
         Q_vv = (dt**2) * Da
-        self.Q = np.block([
-            [Q_pp, Q_pv],
-            [Q_pv, Q_vv]
-        ]).astype(float)
+        if self.enable_gravity_state_estimation:
+            self.Q = np.zeros((7, 7), dtype=float)
+            self.Q[:3, :3] = Q_pp
+            self.Q[:3, 3:6] = Q_pv
+            self.Q[3:6, :3] = Q_pv
+            self.Q[3:6, 3:6] = Q_vv
+            self.Q[6, 6] = (self.gravity_state_process_noise ** 2) * max(float(dt), 1e-6)
+        else:
+            self.Q = np.block([
+                [Q_pp, Q_pv],
+                [Q_pv, Q_vv]
+            ]).astype(float)
 
         # 测量噪声协方差 R
         if isinstance(measurement_noise, (list, tuple, np.ndarray)):
@@ -1341,10 +1375,12 @@ class KalmanFilter3D:
     def _sync_public_state(self):
         source = self.active_state_source 
         if source == 'online_fit' and self.online_fit_initialized:
-            self.x = self.online_fit_x.copy()
+            self.x[:3] = self.online_fit_x[:3].copy()
+            self.x[3:6] = self.online_fit_x[3:6].copy()
             self.active_state_source = 'online_fit'
         else:
-            self.x = self.kf_x.copy()
+            self.x[:3] = self.kf_x[:3].copy()
+            self.x[3:6] = self.kf_x[3:6].copy()
             self.active_state_source = 'kf'
 
 
@@ -1360,15 +1396,24 @@ class KalmanFilter3D:
             velocity = np.zeros(3, dtype=float)
 
         self.kf_x[:3] = np.asarray(position, dtype=float)
-        self.kf_x[3:] = np.asarray(velocity, dtype=float)
+        self.kf_x[3:6] = np.asarray(velocity, dtype=float)
+        if self.enable_gravity_state_estimation:
+            self.kf_x[6] = float(self.g)
 
         self.online_fit_x[:3] = np.asarray(position, dtype=float)
         self.online_fit_x[3:] = np.asarray(velocity, dtype=float)
         self.online_fit_initialized = True
 
         # 初始协方差：位置较确定，速度稍不确定
-        self.P = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]).astype(float)
-        self.velocity_uncertainty = np.diag(self.P)[3:]
+        if self.enable_gravity_state_estimation:
+            self.P = np.diag([
+                1.0, 1.0, 1.0,
+                2.0, 2.0, 2.0,
+                float(self.gravity_state_initial_std) ** 2,
+            ]).astype(float)
+        else:
+            self.P = np.diag([1.0, 1.0, 1.0, 2.0, 2.0, 2.0]).astype(float)
+        self.velocity_uncertainty = np.diag(self.P)[3:6]
 
         t0 = float(self.filter_time_sec)
         self.filter_time_sec = float(t0)
@@ -1492,10 +1537,10 @@ class KalmanFilter3D:
         vel_inflate = np.diag(vel_std ** 2)
 
         self.P[:3, :3] += pos_inflate
-        self.P[3:, 3:] += vel_inflate
+        self.P[3:6, 3:6] += vel_inflate
 
         self.P = 0.5 * (self.P + self.P.T)
-        self.velocity_uncertainty = np.diag(self.P)[3:]
+        self.velocity_uncertainty = np.diag(self.P)[3:6]
 
     def predict(self):
         """预测步骤（考虑重力和二次空气阻力）"""
@@ -1506,9 +1551,10 @@ class KalmanFilter3D:
 
         dt = self.dt
         pos = self.kf_x[:3].copy()
-        vel = self.kf_x[3:].copy()
+        vel = self.kf_x[3:6].copy()
+        g_dyn = float(self.kf_x[6]) if self.enable_gravity_state_estimation else float(self.g)
 
-        a_gravity = np.array([0.0, 0.0, -self.g], dtype=float)
+        a_gravity = np.array([0.0, 0.0, -g_dyn], dtype=float)
         a_drag, J_drag = self._compute_drag_acceleration_and_jacobian(vel)
         a_total = a_gravity + a_drag
 
@@ -1517,24 +1563,44 @@ class KalmanFilter3D:
         vel_new = vel + a_total * dt
 
         self.kf_x[:3] = pos_new
-        self.kf_x[3:] = vel_new
+        self.kf_x[3:6] = vel_new
+        if self.enable_gravity_state_estimation:
+            # g 采用随机游走模型，均值保持
+            self.kf_x[6] = g_dyn
 
         # 线性化雅可比
         I3 = np.eye(3, dtype=float)
-        self.F = np.block([
-            [I3, dt * I3 + 0.5 * dt**2 * J_drag],
-            [np.zeros((3, 3), dtype=float), I3 + dt * J_drag]
-        ])
+        if self.enable_gravity_state_estimation:
+            dp_dv = dt * I3 + 0.5 * dt**2 * J_drag
+            dv_dv = I3 + dt * J_drag
+            dp_dg = np.array([[0.0], [0.0], [-0.5 * dt**2]], dtype=float)
+            dv_dg = np.array([[0.0], [0.0], [-dt]], dtype=float)
+            self.F = np.block([
+                [I3, dp_dv, dp_dg],
+                [np.zeros((3, 3), dtype=float), dv_dv, dv_dg],
+                [np.zeros((1, 3), dtype=float), np.zeros((1, 3), dtype=float), np.ones((1, 1), dtype=float)],
+            ])
+        else:
+            self.F = np.block([
+                [I3, dt * I3 + 0.5 * dt**2 * J_drag],
+                [np.zeros((3, 3), dtype=float), I3 + dt * J_drag]
+            ])
 
-        self.B = np.array(
-            [0.0, 0.0, -0.5 * self.g * dt**2, 0.0, 0.0, -self.g * dt],
-            dtype=float
-        )
+        if self.enable_gravity_state_estimation:
+            self.B = np.array(
+                [0.0, 0.0, -0.5 * g_dyn * dt**2, 0.0, 0.0, -g_dyn * dt, 0.0],
+                dtype=float
+            )
+        else:
+            self.B = np.array(
+                [0.0, 0.0, -0.5 * self.g * dt**2, 0.0, 0.0, -self.g * dt],
+                dtype=float
+            )
 
         # 协方差预测
         self.P = self.F @ self.P @ self.F.T + self.Q
         self.P = 0.5 * (self.P + self.P.T)
-        self.velocity_uncertainty = np.diag(self.P)[3:]
+        self.velocity_uncertainty = np.diag(self.P)[3:6]
 
         # 在线拟合状态在 predict 阶段按动力学外推
         self._predict_online_fit_state(dt)
@@ -1658,11 +1724,11 @@ class KalmanFilter3D:
         self.kf_x = self.kf_x + K @ y_sel
 
         # Joseph form 协方差更新
-        I = np.eye(6, dtype=float)
+        I = np.eye(self.state_dim, dtype=float)
         KH = K @ H_sel
         self.P = (I - KH) @ self.P @ (I - KH).T + K @ R_eff @ K.T
         self.P = 0.5 * (self.P + self.P.T)
-        self.velocity_uncertainty = np.diag(self.P)[3:]
+        self.velocity_uncertainty = np.diag(self.P)[3:6]
 
         # 统计量
         self.update_count += 1
@@ -1705,13 +1771,15 @@ class KalmanFilter3D:
 
         return {
             'position': self.x[:3].copy(),
-            'velocity': self.x[3:].copy(),
+            'velocity': self.x[3:6].copy(),
             'full_state': self.x.copy(),
             'state_source': self.active_state_source,
 
             'kf_position': self.kf_x[:3].copy(),
-            'kf_velocity': self.kf_x[3:].copy(),
+            'kf_velocity': self.kf_x[3:6].copy(),
             'kf_full_state': self.kf_x.copy(),
+            'gravity': float(self.kf_x[6]) if self.enable_gravity_state_estimation else float(self.g),
+            'gravity_state_enabled': bool(self.enable_gravity_state_estimation),
 
             'online_fit_position': fit_pos,
             'online_fit_velocity': fit_vel,
@@ -1758,12 +1826,13 @@ class KalmanFilter3D:
             return None, None
 
         self._sync_public_state()
-        velocity_uncertainty = np.diag(self.P)[3:]
+        velocity_uncertainty = np.diag(self.P)[3:6]
         if np.any(velocity_uncertainty > max_velocity_uncertainty):
             return None, None
 
         pos = self.x[:3].copy()
-        vel = self.x[3:].copy()
+        vel = self.x[3:6].copy()
+        g_sim = float(self.kf_x[6]) if self.enable_gravity_state_estimation else float(self.g)
 
         if pos[2] <= z_threshold or np.linalg.norm(vel) < 1e-6:
             return None, None
@@ -1792,7 +1861,7 @@ class KalmanFilter3D:
             else:
                 a_drag = np.zeros(3, dtype=float)
 
-            a_total = np.array([0.0, 0.0, -self.g], dtype=float) + a_drag
+            a_total = np.array([0.0, 0.0, -g_sim], dtype=float) + a_drag
 
             sim_pos = sim_pos + sim_vel * dt_sim + 0.5 * a_total * dt_sim**2
             sim_vel = sim_vel + a_total * dt_sim
@@ -1819,11 +1888,13 @@ class KalmanFilter3D:
 
     def reset(self):
         """重置滤波器"""
-        self.kf_x = np.zeros(6, dtype=float)
+        self.kf_x = np.zeros(self.state_dim, dtype=float)
+        if self.enable_gravity_state_estimation:
+            self.kf_x[6] = float(self.g)
         self.online_fit_x = np.zeros(6, dtype=float)
         self.x = np.zeros(6, dtype=float)
-        self.P = np.eye(6, dtype=float) * 10.0
-        self.velocity_uncertainty = np.diag(self.P)[3:]
+        self.P = np.eye(self.state_dim, dtype=float) * 10.0
+        self.velocity_uncertainty = np.diag(self.P)[3:6]
 
         self.online_fit_initialized = False
         self.online_fit_last_update_time = None
@@ -2641,6 +2712,8 @@ class BallTracker:
                         'velocity': velocity_to_store,
                         'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
                         'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                        'gravity': state.get('gravity', None),
+                        'gravity_state_enabled': bool(state.get('gravity_state_enabled', False)),
                         'innovation_r': None,
                         'innovation_S_diag': None,
                         'normalized_innovation': None,
@@ -2655,6 +2728,8 @@ class BallTracker:
                         'velocity': velocity_body.copy(),
                         'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
                         'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                        'gravity': state.get('gravity', None),
+                        'gravity_state_enabled': bool(state.get('gravity_state_enabled', False)),
                         'innovation_r': None,
                         'innovation_S_diag': None,
                         'normalized_innovation': None,
@@ -2990,6 +3065,8 @@ class BallTracker:
                                 'velocity': velocity_to_store,
                                 'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
                                 'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                                'gravity': state.get('gravity', None),
+                                'gravity_state_enabled': bool(state.get('gravity_state_enabled', False)),
                                 'innovation_r': None if state.get('innovation_r') is None else state['innovation_r'].copy(),
                                 'innovation_S_diag': None if state.get('innovation_S_diag') is None else state['innovation_S_diag'].copy(),
                                 'normalized_innovation': None if state.get('normalized_innovation') is None else state['normalized_innovation'].copy(),
@@ -3000,6 +3077,8 @@ class BallTracker:
                                 'velocity': velocity_body.copy(),
                                 'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
                                 'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                                'gravity': state.get('gravity', None),
+                                'gravity_state_enabled': bool(state.get('gravity_state_enabled', False)),
                                 'innovation_r': None if state.get('innovation_r') is None else state['innovation_r'].copy(),
                                 'innovation_S_diag': None if state.get('innovation_S_diag') is None else state['innovation_S_diag'].copy(),
                                 'normalized_innovation': None if state.get('normalized_innovation') is None else state['normalized_innovation'].copy(),
@@ -3013,6 +3092,8 @@ class BallTracker:
                                 'velocity': velocity_to_store,
                                 'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
                                 'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                                'gravity': state.get('gravity', None),
+                                'gravity_state_enabled': bool(state.get('gravity_state_enabled', False)),
                                 'innovation_r': None if state.get('innovation_r') is None else state['innovation_r'].copy(),
                                 'innovation_S_diag': None if state.get('innovation_S_diag') is None else state['innovation_S_diag'].copy(),
                                 'normalized_innovation': None if state.get('normalized_innovation') is None else state['normalized_innovation'].copy(),
@@ -3023,6 +3104,8 @@ class BallTracker:
                                 'velocity': velocity_body.copy(),
                                 'kf_pos_var': None if state.get('position_uncertainty') is None else state['position_uncertainty'].copy(),
                                 'kf_vel_var': None if state.get('velocity_uncertainty') is None else state['velocity_uncertainty'].copy(),
+                                'gravity': state.get('gravity', None),
+                                'gravity_state_enabled': bool(state.get('gravity_state_enabled', False)),
                                 'innovation_r': None if state.get('innovation_r') is None else state['innovation_r'].copy(),
                                 'innovation_S_diag': None if state.get('innovation_S_diag') is None else state['innovation_S_diag'].copy(),
                                 'normalized_innovation': None if state.get('normalized_innovation') is None else state['normalized_innovation'].copy(),

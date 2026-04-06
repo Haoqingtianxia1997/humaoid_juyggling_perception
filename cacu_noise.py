@@ -121,6 +121,7 @@ def _load_detection_series(json_path: Path):
 	online_det_fit_pos = []
 	online_det_fit_vel = []
 	base_positions = []
+	kf_gravity = []
 	for fr in frames:
 		body_pos = _safe_vec3(fr.get("body_pos", None))
 		body_rot = _safe_rot3x3(fr.get("body_rot", None))
@@ -154,6 +155,12 @@ def _load_detection_series(json_path: Path):
 			base_positions.append(np.asarray(body_pos, dtype=float))
 		else:
 			base_positions.append(np.asarray([np.nan, np.nan, np.nan], dtype=float))
+
+		g = fr.get("kf_g", None)
+		if g is not None and np.isfinite(float(g)):
+			kf_gravity.append(float(g))
+		else:
+			kf_gravity.append(np.nan)
 
 		contour_areas.append(float(fr.get("contour_area")) if fr.get("contour_area", None) is not None else np.nan)
 
@@ -257,6 +264,7 @@ def _load_detection_series(json_path: Path):
 		online_det_fit_pos,
 		online_det_fit_vel,
 		base_positions,
+		kf_gravity,
 	)
 
 
@@ -291,6 +299,43 @@ def _plot_base_pos_vs_time(
 
 	output_dir.mkdir(parents=True, exist_ok=True)
 	out_path = output_dir / f"{json_path.stem}_figure0_base_pos_vs_t.png"
+	fig.savefig(out_path, dpi=160)
+	print(f"[已保存] {out_path}")
+
+	if show:
+		plt.show()
+
+	plt.close(fig)
+
+
+def _plot_gravity_vs_time(
+	json_path: Path,
+	output_dir: Path,
+	times: np.ndarray,
+	kf_gravity: np.ndarray,
+	show: bool,
+):
+	"""按时间戳绘制重力状态估计（仅在存在有效 kf_g 时绘制）。"""
+	if kf_gravity.size == 0:
+		return
+
+	valid = np.isfinite(times) & np.isfinite(kf_gravity)
+	if not np.any(valid):
+		print(f"[跳过] {json_path.name}: 未记录 kf_g 或无有效值")
+		return
+
+	fig, ax = plt.subplots(1, 1, figsize=(8, 3.8))
+	ax.plot(times[valid], kf_gravity[valid], color="tab:purple", linewidth=1.8, label="kf_g")
+	ax.scatter(times[valid], kf_gravity[valid], color="tab:purple", s=14, alpha=0.9)
+	ax.set_xlabel("t (s)")
+	ax.set_ylabel("g (m/s²)")
+	ax.set_title(f"FigureG | {json_path.stem} | kf_g (timestamp aligned)")
+	ax.grid(True, alpha=0.3)
+	ax.legend(loc="best")
+	fig.tight_layout()
+
+	output_dir.mkdir(parents=True, exist_ok=True)
+	out_path = output_dir / f"{json_path.stem}_figureG_kf_g_vs_t.png"
 	fig.savefig(out_path, dpi=160)
 	print(f"[已保存] {out_path}")
 
@@ -564,7 +609,7 @@ def _collect_global_error_stats(json_files: list[Path], fit_method: str, fit_sou
 	global_err_down = {"x": [], "y": [], "z": [], "vx": [], "vy": [], "vz": []}
 
 	for js in json_files:
-		points, gt_points, _, times, kf_update_pos, kf_update_vel, _, _, _, _, _, _, _, _ = _load_detection_series(js)
+		points, gt_points, _, times, kf_update_pos, kf_update_vel, _, _, _, _, _, _, _, _, _ = _load_detection_series(js)
 		if not points:
 			continue
 		det_pts = np.asarray(points, dtype=float)
@@ -608,7 +653,7 @@ def _collect_global_online_det_vs_gt_fit_stats(json_files: list[Path], fit_metho
 	}
 
 	for js in json_files:
-		points, gt_points, _, times, _, _, _, _, _, _, _, online_det_fit_pos, online_det_fit_vel, _ = _load_detection_series(js)
+		points, gt_points, _, times, _, _, _, _, _, _, _, online_det_fit_pos, online_det_fit_vel, _, _ = _load_detection_series(js)
 		if not points:
 			continue
 
@@ -1275,6 +1320,7 @@ def _plot_one_trajectory(
 		online_det_fit_pos,
 		online_det_fit_vel,
 		base_positions,
+		kf_gravity,
 	) = _load_detection_series(json_path)
 
 	if not points:
@@ -1316,6 +1362,15 @@ def _plot_one_trajectory(
 		output_dir=output_dir,
 		times=ts,
 		base_pos=base_pos,
+		show=show,
+	)
+
+	# 0.1) 单独绘制 kf_g（仅在存在记录时出图，时间戳严格对齐）
+	_plot_gravity_vs_time(
+		json_path,
+		output_dir=output_dir,
+		times=ts,
+		kf_gravity=np.asarray(kf_gravity, dtype=float),
 		show=show,
 	)
 

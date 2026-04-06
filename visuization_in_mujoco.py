@@ -681,19 +681,8 @@ def _detection_world_from_frame(
 
 
 def find_init_update_index(frames: list[FrameData], first_predict_idx: int) -> int | None:
-	# 严格模式：优先在“首个predict之前”寻找下降段最后一次update
-	descending_updates = [
-		i
-		for i in range(first_predict_idx)
-		if frames[i].kf_state == "update"
-		and frames[i].kf_vel_body is not None
-		and frames[i].kf_vel_body[2] < 0.0
-	]
-	if descending_updates:
-		return descending_updates[-1]
-
-	# 兜底：有些轨迹会先经历一段predict，再在后半段重新检测到并进入下降update。
-	# 这种情况下回退到“全轨迹最后一个下降update”，避免整条轨迹被跳过。
+	# 优先策略：全轨迹最后一个下降段 update。
+	# 这样可直接锚定到最新、最稳定的下降更新点。
 	global_descending_updates = [
 		i
 		for i, fr in enumerate(frames)
@@ -703,6 +692,17 @@ def find_init_update_index(frames: list[FrameData], first_predict_idx: int) -> i
 	]
 	if global_descending_updates:
 		return global_descending_updates[-1]
+
+	# 兼容兜底：仅在首个 predict 之前找下降 update（通常不会走到这里）
+	descending_updates_before_predict = [
+		i
+		for i in range(first_predict_idx)
+		if frames[i].kf_state == "update"
+		and frames[i].kf_vel_body is not None
+		and frames[i].kf_vel_body[2] < 0.0
+	]
+	if descending_updates_before_predict:
+		return descending_updates_before_predict[-1]
 
 	return None
 
@@ -807,7 +807,7 @@ def build_one_trajectory(
 		print(f"[skip] {json_path.name}: 未找到下降段最后一次 update(vz<0)，严格模式下跳过")
 		return None
 	if init_idx >= first_predict:
-		print(f"[warn] {json_path.name}: 首个predict前无下降update，回退到全轨迹最后一个下降update(idx={init_idx})")
+		print(f"[info] {json_path.name}: 使用全轨迹最后一个下降update作为锚点(idx={init_idx})")
 	init_fr = frames[init_idx]
 	base_pos_ref = frames[0].base_pos.copy()
 	if init_fr.kf_pos_body is None or init_fr.kf_vel_body is None:

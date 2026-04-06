@@ -148,6 +148,12 @@ tracker:
   kalman:
     # 重力加速度 (m/s²)
     g: 9.8
+    # 是否将重力 g 作为状态参与估计（state=[x,y,z,vx,vy,vz,g]）
+    enable_gravity_state_estimation: true
+    # g 状态过程噪声（随机游走标准差，单位 m/s^2 / sqrt(s)）
+    gravity_state_process_noise: 0.0
+    # g 状态初始标准差（单位 m/s^2）
+    gravity_state_initial_std: 0.5
     # 卡尔曼滤波过程噪声（提高值会降低对预测的信任）
     process_noise: [0.0002, 0.0001, 0.0002]
     # 卡尔曼滤波观测噪声（降低值会提高对观测的信任）
@@ -174,11 +180,11 @@ tracker:
     # z 方向多项式阶数（推荐 2）
     online_fit_z_degree: 2
     # 默认对外状态来源："kf" / "online_fit"
-    active_state_source: "online_fit"
+    active_state_source: "kf"
     # predict source
-    predict_source: "online_fit"
+    predict_source: "kf"
     # update source
-    update_source: "online_fit"
+    update_source: "kf"
 
 
   # 轨迹输出参数

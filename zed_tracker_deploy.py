@@ -848,6 +848,13 @@ class BallTrackingNode(Node):
                         'rgb_overlay_file': f"rgb_overlay_{frame_idx:06d}.png",
                         'depth_file': f"depth_{frame_idx:06d}.npy"
                     }
+
+                    # 仅在 g 作为状态参与估计时记录重力状态
+                    g_enabled = bool(kf_data.get('gravity_state_enabled', False))
+                    g_value = kf_data.get('gravity', None)
+                    if g_enabled and g_value is not None:
+                        frame_data['kf_g'] = float(g_value)
+
                     self.trajectory_data[tracker_id].append(frame_data)
                     
                     # 定期打印记录状态
