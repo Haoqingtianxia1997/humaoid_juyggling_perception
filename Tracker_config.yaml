@@ -119,7 +119,7 @@ tracker:
     # 速度不确定性最大值 (m/s)
     max_velocity_uncertainty: 0.5
     # 使用机器人数据
-    use_robot_data: true
+    use_robot_data: false
 
 
   # 数据关联参数（BallTracker._match_detections）
