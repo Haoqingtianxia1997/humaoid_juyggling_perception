@@ -1006,7 +1006,8 @@ class BallTrackingNode(Node):
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
         # 显示 FPS
-        cv2.putText(rgb_vis, f"FPS: {1.0/self.dt:.0f}", (rgb_vis.shape[1] - 100, 30),
+        display_fps = (1.0 / self.dt_dynamic) if (self.dt_dynamic is not None and self.dt_dynamic > 0.0) else (1.0 / self.dt)
+        cv2.putText(rgb_vis, f"FPS: {display_fps:.1f}", (rgb_vis.shape[1] - 110, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # 旋转图像（顺时针90度）
