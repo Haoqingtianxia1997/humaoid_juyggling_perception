@@ -177,6 +177,8 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
     last_online_fit_pos = None
     last_online_fit_vel = None
     last_online_fit_t = None
+    last_body_pos = None
+    last_body_rot = None
 
     # 与 zed_tracker_deploy 流程一致，保留清理调用
     kf_obs = [None]
@@ -208,6 +210,11 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
         t_curr = float(t_rel[i])
         dt_curr = float(dt_to_prev[i]) if i < len(dt_to_prev) else dt_default
 
+        body_pos, body_rot = _parse_body_pose(fr)
+        if body_pos is not None and body_rot is not None:
+            last_body_pos = body_pos
+            last_body_rot = body_rot
+
         det_raw = fr.get("detection_pos", None)
         det = None
         if det_raw is not None:
@@ -215,7 +222,6 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
             if source_coord_frame == "world":
                 det = det_arr
             else:
-                body_pos, body_rot = _parse_body_pose(fr)
                 if body_pos is not None and body_rot is not None:
                     # 统一到世界坐标系后再喂给离线KF
                     det = body_rot @ det_arr + body_pos
@@ -224,7 +230,12 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
 
         # 1) predict（仅对已验证tracker）
         if tracker.is_validated(0):
-            tracker.predict_all(ground_z_threshold=ground_z_threshold, dt=dt_curr)
+            tracker.predict_all(
+                ground_z_threshold=ground_z_threshold,
+                dt=dt_curr,
+                base_site_rot=last_body_rot,
+                base_site_pos=last_body_pos,
+            )
 
         # 2) cleanup grounded
         tracker.cleanup_grounded_balls(kf_obs, kf_obs_body)

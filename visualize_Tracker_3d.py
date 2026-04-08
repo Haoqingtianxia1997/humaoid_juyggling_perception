@@ -79,12 +79,26 @@ class TrajectoryVisualizer:
             cx=intr['cx'],
             cy=intr['cy']
         )
+
         
+        use_robot_data = camera_config.get('use_robot_data', False)
         # 相机外参
-        extr = camera_config['extrinsics']
-        camera_position_in_body = np.array(extr['position'])
-        camera_rotation_in_body = np.array(extr['rotation'])
-        
+        if use_robot_data:
+            extr = camera_config['extrinsics']
+            camera_position_in_body = np.array(extr['position'])
+            camera_rotation_in_body = np.array(extr['rotation'])
+            
+        else:
+            # 使用已知标定外参（相机坐标系 -> body/imu_link 坐标系）
+            camera_position_in_body = np.array([-0.010, 0.060, 0.015], dtype=np.float64)
+            camera_rotation_in_body = np.array([
+                [0.0, -0.050, 0.999 ],
+                [-1.0, 0.0  , 0.0   ],
+                [0.0, -0.999, -0.050],
+            ], dtype=np.float64)
+            
+       
+            
         # 构建从相机坐标系到body坐标系的4x4变换矩阵
         self.camera_to_body_transform = np.eye(4)
         self.camera_to_body_transform[:3, :3] = camera_rotation_in_body

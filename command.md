@@ -8,6 +8,8 @@ chmod +x ./desktop_build_dockerfile_from_sdk_ubuntu_and_cuda_version.sh
 
 # open docker
 ```bash
+newgrp docker
+
 docker run -it --rm   --gpus all   --net=host   --privileged   -v /dev:/dev   -v /tmp/.X11-unix:/tmp/.X11-unix   -e DISPLAY=$DISPLAY   zed_ros2_desktop_u22.04_sdk_5.0.7_cuda_12.6.3
 
 ```
@@ -31,3 +33,17 @@ ros2 launch natnet_ros2 natnet_ros2.launch.py   serverIP:=192.168.2.11   clientI
 ros2 topic echo /juggling_ball/pose
 
 ```
+# build tf connection
+```bash
+ros2 run tf2_ros static_transform_publisher 0 0 0 -0.0185099 -0.0185099 -0.7068645 0.7068645 juggling_cam zed_camera_link
+
+```
+
+# get camera extrinsic
+```bash
+
+ros2 run tf2_ros tf2_echo world zed_left_camera_optical_frame
+
+
+```
+ 

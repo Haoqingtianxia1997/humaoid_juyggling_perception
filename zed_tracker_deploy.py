@@ -415,14 +415,36 @@ class BallTrackingNode(Node):
                 cam_rot = np.array(extr['rotation'])
                 return cam_pos, cam_rot
             else:
-                # 使用已知标定外参（相机坐标系 -> body/imu_link 坐标系）
-                cam_pos_rel = np.array([0.00, 0.00, 0.00], dtype=np.float64)
-                cam_rot_rel = np.array([
-                    [0.0,  0.0,  1.0],
-                    [-1.0, 0.0,  0.0],
-                    [0.0, -1.0,  0.0],
+                # # 使用已知标定外参（相机坐标系 -> body/imu_link 坐标系）
+                # cam_pos_rel = np.array([-0.010, 0.060, 0.015], dtype=np.float64)
+                # cam_rot_rel = np.array([
+                #     [0.0, -0.050, 0.999 ],
+                #     [-1.0, 0.0  , 0.0   ],
+                #     [0.0, -0.999, -0.050],
+                # ], dtype=np.float64)
+               
+                transform = self.tf_buffer.lookup_transform(
+                    'zed_camera_link',
+                    'zed_left_camera_optical_frame',
+                    rclpy.time.Time()
+                )
+
+                # 提取位置
+                cam_pos_rel = np.array([
+                    transform.transform.translation.x,
+                    transform.transform.translation.y,
+                    transform.transform.translation.z
                 ], dtype=np.float64)
 
+                # 提取四元数并转换为旋转矩阵
+                quat = np.array([
+                    transform.transform.rotation.w,
+                    transform.transform.rotation.x,
+                    transform.transform.rotation.y,
+                    transform.transform.rotation.z
+                ], dtype=np.float64)
+
+                cam_rot_rel = self.quat_to_rot_matrix(quat)
                 return cam_pos_rel, cam_rot_rel
             
         except Exception as e:
@@ -483,9 +505,37 @@ class BallTrackingNode(Node):
         # 转换到相对坐标（相对于初始位置）
         base_pos = base_pos_world 
         
+        if not self.use_robot_data and self.tf_buffer.can_transform('world', 'zed_camera_link', rclpy.time.Time()):
+            # 使用 TF2 获取相机外参
+            transform = self.tf_buffer.lookup_transform(
+                'world',
+                'zed_camera_link',
+                rclpy.time.Time()
+            )
+
+            # 提取位置
+            base_pos = np.array([
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+                transform.transform.translation.z
+            ], dtype=np.float64)
+
+            # 提取四元数并转换为旋转矩阵
+            quat = np.array([
+                transform.transform.rotation.w,
+                transform.transform.rotation.x,
+                transform.transform.rotation.y,
+                transform.transform.rotation.z
+            ], dtype=np.float64)
+
+            base_rot = self.quat_to_rot_matrix(quat)
+        elif not self.use_robot_data:
+            base_pos = np.array([0.0, 0.0, 0.0])
+            base_rot = np.eye(3)
+
+
         # === 获取相机外参（相对于机器人本体的变换） ===
         cam_pos_rel, cam_rot_rel = self.get_camera_extrinsics()
-        
         # === 计算相机在世界坐标系中的位置和姿态 ===
         # 相机世界位置 = 机器人本体位置 + 旋转后的相机相对位置
         cam_pos = base_pos + base_rot @ cam_pos_rel
@@ -505,6 +555,8 @@ class BallTrackingNode(Node):
             self.ball_tracker.predict_all(
                 ground_z_threshold=self.ground_z_threshold,
                 dt=dt_dynamic,
+                base_site_rot=base_rot,
+                base_site_pos=base_pos,
             )
         
         # === 保存已经落地的轨迹（在清理之前） ===
