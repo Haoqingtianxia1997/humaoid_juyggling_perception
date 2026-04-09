@@ -20,7 +20,7 @@ env/
 trajectory_data/
 trajectory_data_fit/
 trajectory_data_kf/
-trajectory_data_kf_g_tate/
+trajectory_data_kf_g_state/
 
 # Optional large media/data dirs
 data/
