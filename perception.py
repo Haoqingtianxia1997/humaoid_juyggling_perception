@@ -2346,7 +2346,7 @@ class BallTracker:
         self.detected_trajectories = [[] for _ in range(num_balls)]  # 检测轨迹
         self.max_trajectory_length = 1000  # 最大轨迹长度
         
-    def predict_all(self, ground_z_threshold=0.15, dt=None, base_site_rot=None, base_site_pos=None):
+    def predict_all(self, ground_z_threshold=0.15, dt=None, base_site_pos=None):
         """
         对所有激活的滤波器执行预测步骤，并检测落地
         
@@ -2355,7 +2355,6 @@ class BallTracker:
             dt: 可选的动态时间步长（秒）。
                 - 若为有效正数，则本次预测使用该 dt
                 - 否则回退到各追踪器内部配置的固定 dt
-            base_site_rot: base 的旋转矩阵（body->world，3x3）
             base_site_pos: base 的位置向量（world，3,）
         """
         start_time = time.perf_counter() if self.verbose else None
@@ -2373,13 +2372,11 @@ class BallTracker:
 
         # 地面阈值始终在体坐标系下判断：world -> body 需要 base 位姿
         has_body_pose = False
-        base_rot_world = None
         base_pos_world = None
-        if base_site_rot is not None and base_site_pos is not None:
+        if base_site_pos is not None:
             try:
-                base_rot_world = np.asarray(base_site_rot, dtype=float).reshape(3, 3)
                 base_pos_world = np.asarray(base_site_pos, dtype=float).reshape(3)
-                has_body_pose = np.all(np.isfinite(base_rot_world)) and np.all(np.isfinite(base_pos_world))
+                has_body_pose = np.all(np.isfinite(base_pos_world))
             except Exception:
                 has_body_pose = False
 
@@ -2403,10 +2400,7 @@ class BallTracker:
                 if state and state['position'] is not None:
                     if has_body_pose:
                         predicted_pos_world = np.asarray(state['position'], dtype=float).reshape(3)
-                        if base_rot_world is not None:
-                            predicted_pos_body = base_rot_world.T @ (predicted_pos_world - base_pos_world)
-                        else:
-                            predicted_pos_body = predicted_pos_world - base_pos_world
+                        predicted_pos_body = predicted_pos_world - base_pos_world
                         predicted_z_body = float(predicted_pos_body[2])
                         if predicted_z_body < ground_z_threshold:
                             # 标记为已落地
