@@ -555,7 +555,6 @@ class BallTrackingNode(Node):
             self.ball_tracker.predict_all(
                 ground_z_threshold=self.ground_z_threshold,
                 dt=dt_dynamic,
-                base_site_rot=base_rot,
                 base_site_pos=base_pos,
             )
         

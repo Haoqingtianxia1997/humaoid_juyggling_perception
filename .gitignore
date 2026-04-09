@@ -18,6 +18,9 @@ env/
 
 # Generated trajectory data (images/depth/plots/json)
 trajectory_data/
+trajectory_data_fit/
+trajectory_data_kf/
+trajectory_data_kf_g_tate/
 
 # Optional large media/data dirs
 data/

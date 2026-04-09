@@ -2346,73 +2346,70 @@ class BallTracker:
         self.detected_trajectories = [[] for _ in range(num_balls)]  # 检测轨迹
         self.max_trajectory_length = 1000  # 最大轨迹长度
         
-    def predict_all(self, ground_z_threshold=0.15, dt=None, base_site_rot=None, base_site_pos=None):
-        """
-        对所有激活的滤波器执行预测步骤，并检测落地
-        
-        Args:
-            ground_z_threshold: 体坐标系下的地面高度阈值（米），低于此高度认为球已落地
-            dt: 可选的动态时间步长（秒）。
-                - 若为有效正数，则本次预测使用该 dt
-                - 否则回退到各追踪器内部配置的固定 dt
-            base_site_rot: base 的旋转矩阵（body->world，3x3）
-            base_site_pos: base 的位置向量（world，3,）
-        """
-        start_time = time.perf_counter() if self.verbose else None
-        active_count = 0
-
-        # 动态 dt：仅当是有效正数时启用
-        use_dynamic_dt = False
-        dt_value = None
-        if dt is not None:
-            try:
-                dt_value = float(dt)
-                use_dynamic_dt = np.isfinite(dt_value) and dt_value > 0.0
-            except Exception:
-                use_dynamic_dt = False
-
-        # 地面阈值始终在体坐标系下判断：world -> body 需要 base 位姿
-        has_body_pose = False
-        base_rot_world = None
-        base_pos_world = None
-        if base_site_rot is not None and base_site_pos is not None:
-            try:
-                base_rot_world = np.asarray(base_site_rot, dtype=float).reshape(3, 3)
-                base_pos_world = np.asarray(base_site_pos, dtype=float).reshape(3)
-                has_body_pose = np.all(np.isfinite(base_rot_world)) and np.all(np.isfinite(base_pos_world))
-            except Exception:
-                has_body_pose = False
-
-        if self.verbose and not has_body_pose:
-            print("[落地检测] 缺少base位姿，跳过体坐标系落地判断")
-        
-        for tracker_id in range(self.num_balls):
-            # 跳过已落地或未初始化的追踪器
-            if self.ball_grounded[tracker_id] or not self.kf_filters[tracker_id].initialized:
-                continue
+    def predict_all(self, ground_z_threshold=0.15, dt=None, base_site_pos=None):
+            """
+            对所有激活的滤波器执行预测步骤，并检测落地
             
-            active_count += 1
-            if use_dynamic_dt:
-                self.kf_filters[tracker_id].dt = dt_value
-            # 正常预测
-            self.kf_filters[tracker_id].predict()
+            Args:
+                ground_z_threshold: 体坐标系下的地面高度阈值（米），低于此高度认为球已落地
+                dt: 可选的动态时间步长（秒）。
+                    - 若为有效正数，则本次预测使用该 dt
+                    - 否则回退到各追踪器内部配置的固定 dt
+                base_site_pos: base 的位置向量（world，3,）
+            """
+            start_time = time.perf_counter() if self.verbose else None
+            active_count = 0
+
+            # 动态 dt：仅当是有效正数时启用
+            use_dynamic_dt = False
+            dt_value = None
+            if dt is not None:
+                try:
+                    dt_value = float(dt)
+                    use_dynamic_dt = np.isfinite(dt_value) and dt_value > 0.0
+                except Exception:
+                    use_dynamic_dt = False
+
+            # 地面阈值始终在体坐标系下判断：world -> body 需要 base 位姿
+            has_body_pose = False
+            base_pos_world = None
+            if base_site_pos is not None:
+                try:
+                    base_pos_world = np.asarray(base_site_pos, dtype=float).reshape(3)
+                    has_body_pose = np.all(np.isfinite(base_pos_world))
+                except Exception:
+                    has_body_pose = False
+
+            if self.verbose and not has_body_pose:
+                print("[落地检测] 缺少base位姿，跳过体坐标系落地判断")
             
-            # 预测后检查是否落地（使用tracker自己的预测位置）
-            if self.ever_validated[tracker_id]:  # 只对已验证的追踪器检测落地
-                state = self.get_state(tracker_id)
-                if state and state['position'] is not None:
-                    if has_body_pose:
-                        predicted_pos_world = np.asarray(state['position'], dtype=float).reshape(3)
-                        predicted_pos_body = base_rot_world.T @ (predicted_pos_world - base_pos_world)
-                        predicted_z_body = float(predicted_pos_body[2])
-                        if predicted_z_body < ground_z_threshold:
-                            # 标记为已落地
-                            self.ball_grounded[tracker_id] = True
-                            print(f"[落地检测] 追踪器{tracker_id}检测到落地（体坐标z={predicted_z_body:.3f}m < {ground_z_threshold}m）") if tracker_id == 2 else None
-        
-        if self.verbose and active_count > 0:
-            elapsed_time = (time.perf_counter() - start_time) * 1000
-            print(f"[Tracker predict_all] 预测{active_count}个追踪器，总耗时: {elapsed_time:.4f}ms，平均: {elapsed_time/active_count:.4f}ms/tracker")
+            for tracker_id in range(self.num_balls):
+                # 跳过已落地或未初始化的追踪器
+                if self.ball_grounded[tracker_id] or not self.kf_filters[tracker_id].initialized:
+                    continue
+                
+                active_count += 1
+                if use_dynamic_dt:
+                    self.kf_filters[tracker_id].dt = dt_value
+                # 正常预测
+                self.kf_filters[tracker_id].predict()
+                
+                # 预测后检查是否落地（使用tracker自己的预测位置）
+                if self.ever_validated[tracker_id]:  # 只对已验证的追踪器检测落地
+                    state = self.get_state(tracker_id)
+                    if state and state['position'] is not None:
+                        if has_body_pose:
+                            predicted_pos_world = np.asarray(state['position'], dtype=float).reshape(3)
+                            predicted_pos_body = predicted_pos_world - base_pos_world
+                            predicted_z_body = float(predicted_pos_body[2])
+                            if predicted_z_body < ground_z_threshold:
+                                # 标记为已落地
+                                self.ball_grounded[tracker_id] = True
+                                print(f"[落地检测] 追踪器{tracker_id}检测到落地（体坐标z={predicted_z_body:.3f}m < {ground_z_threshold}m）") if tracker_id == 2 else None
+            
+            if self.verbose and active_count > 0:
+                elapsed_time = (time.perf_counter() - start_time) * 1000
+                print(f"[Tracker predict_all] 预测{active_count}个追踪器，总耗时: {elapsed_time:.4f}ms，平均: {elapsed_time/active_count:.4f}ms/tracker")
     
     def _match_detections(self, detections):
         """
