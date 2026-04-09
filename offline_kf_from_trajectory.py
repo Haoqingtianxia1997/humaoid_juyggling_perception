@@ -233,7 +233,7 @@ def run_one_trajectory(json_path: Path, tracker_params: dict[str, Any], predict_
             tracker.predict_all(
                 ground_z_threshold=ground_z_threshold,
                 dt=dt_curr,
-                base_site_rot=last_body_rot,
+                base_site_rot=None, # last_body_rot
                 base_site_pos=last_body_pos,
             )
 

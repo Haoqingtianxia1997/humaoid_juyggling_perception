@@ -2403,7 +2403,10 @@ class BallTracker:
                 if state and state['position'] is not None:
                     if has_body_pose:
                         predicted_pos_world = np.asarray(state['position'], dtype=float).reshape(3)
-                        predicted_pos_body = base_rot_world.T @ (predicted_pos_world - base_pos_world)
+                        if base_rot_world is not None:
+                            predicted_pos_body = base_rot_world.T @ (predicted_pos_world - base_pos_world)
+                        else:
+                            predicted_pos_body = predicted_pos_world - base_pos_world
                         predicted_z_body = float(predicted_pos_body[2])
                         if predicted_z_body < ground_z_threshold:
                             # 标记为已落地
